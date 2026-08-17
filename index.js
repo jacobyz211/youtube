@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.3.0
+// author: ricky | version: 2.3.1
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 // YTM_API_KEY: set this as a Cloudflare Workers secret (YTM_API_KEY) to avoid exposing it.
@@ -65,7 +65,7 @@ const ANDROID_NATIVE_UA = 'com.google.android.youtube/20.22.36 (Linux; U; Androi
 //   wrangler secret put YT_COOKIE         (optional — __Secure-3PSID + SAPISID from youtube.com cookies, fixes Android "Please sign in")
 const MWEB_CLIENT = {
   clientName: 'MWEB',
-  clientVersion: '2.20260530.07.00',
+  clientVersion: '2.20260810.01.00',
   hl: 'en',
   gl: 'US',
 };
@@ -104,36 +104,9 @@ const ANDROID_MUSIC_UA = 'com.google.android.apps.youtube.music/7.27.0 (Linux; U
 const IOS_UA           = 'com.google.ios.youtube/20.12.4 (iPhone17,3; U; CPU iOS 18_4_1 like Mac OS X)';
 
 // ─── PO Token helpers ─────────────────────────────────────────────────────────
-//
-// PO tokens authenticate the player request to YouTube, bypassing bot/sign-in errors.
-// They cannot be generated server-side (require a real browser via BotGuard/DroidGuard).
-//
-// How to get your tokens:
-//   1. Open music.youtube.com in Chrome → DevTools → Network tab → filter: "v1/player"
-//   2. Play any song — click the player request → Payload tab
-//   3. Copy "serviceIntegrityDimensions.poToken"  → set as YT_PO_TOKEN secret
-//   4. Copy "context.client.visitorData"           → set as YT_VISITOR_DATA secret
-//
-// How to get your cookie (fixes Android "Please sign in"):
-//   1. Open youtube.com in Chrome → DevTools → Application → Cookies → youtube.com
-//   2. Copy the value of __Secure-3PSID and SAPISID
-//   3. Format as: "__Secure-3PSID=VALUE; SAPISID=VALUE"
-//   4. wrangler secret put YT_COOKIE
-//
-// Deploy secrets:
-//   wrangler secret put YT_PO_TOKEN
-//   wrangler secret put YT_VISITOR_DATA
-//   wrangler secret put YT_COOKIE        (optional but recommended)
-//
-// Tokens expire after a few hours. Re-run the steps above to rotate them.
-// For fully automated rotation, deploy iv-org/youtube-trusted-session-generator on
-// Oracle Cloud Free Tier and point YT_PO_TOKEN_GENERATOR_URL at it.
-
 async function getPoToken(env) {
-  // 1. Try Upstash cache (populated by auto-rotation if configured)
   const cached = await upstashCmd(env, 'GET', 'ytm:po_token');
   if (cached && typeof cached === 'string' && cached.length > 4) return cached;
-  // 2. Fall back to static secret
   return env?.YT_PO_TOKEN || null;
 }
 
@@ -143,8 +116,6 @@ async function getPoVisitorData(env) {
   return env?.YT_VISITOR_DATA || null;
 }
 
-// Injects poToken + optional visitorData into any player request body.
-// Safe to call even when no token is configured — returns body unchanged.
 async function withPoToken(body, env) {
   const poToken = await getPoToken(env);
   if (!poToken) return body;
@@ -160,9 +131,6 @@ async function withPoToken(body, env) {
   return enriched;
 }
 
-// Optional: auto-rotate PO tokens from a self-hosted generator (e.g. Oracle Cloud).
-// Set YT_PO_TOKEN_GENERATOR_URL to enable. Generator must return:
-//   { po_token: "...", visitor_data: "..." }
 async function tryRefreshPoToken(env) {
   const generatorUrl = env?.YT_PO_TOKEN_GENERATOR_URL;
   if (!generatorUrl) return;
@@ -218,7 +186,6 @@ async function fetchFreshVisitorData(env, userToken) {
       if (attempt < 3) await new Promise(r => setTimeout(r, 300 * attempt));
     }
   }
-  // Return empty string so buildIosContext still produces a valid context object
   return '';
 }
 function tryRefreshVisitor(data, env, userToken) {
@@ -678,8 +645,6 @@ async function fetchPlayerDataAndroid(trackId, env) {
 }
 
 // MWEB client — PRIMARY streaming client (replaces dead TVHTML5)
-// Mobile web is far less aggressively blocked from Cloudflare datacenter IPs.
-// Returns hlsManifestUrl. PO token injected automatically if YT_PO_TOKEN is set.
 async function fetchPlayerDataMWeb(trackId, env) {
   const baseBody = {
     context: {
@@ -739,9 +704,6 @@ async function fetchPlayerDataWebCreator(trackId, env) {
 }
 
 // ANDROID native app client — progressive MP4 fallback.
-// Native app clients are less aggressively bot-checked than WEB/MWEB from
-// datacenter IPs and don't strictly require a fresh PO token to resolve
-// the muxed "formats" array (unlike adaptiveFormats, which is audio-only).
 async function fetchPlayerDataAndroidNative(trackId, env) {
   const baseBody = {
     context: { client: ANDROID_NATIVE_CLIENT },
@@ -836,21 +798,14 @@ function pickProgressiveFormat(sd) {
 }
 
 // /stream/{id}
-//
-// Cascade strategy — TVHTML5 is dead from Cloudflare IPs (returns "no longer supported").
-// New cascade uses clients that are harder to bot-detect from datacenter IPs:
-//
-//  1. MWEB           → hlsManifestUrl → 302 redirect  (primary: mobile web, lowest block rate)
-//  2. WEB_CREATOR    → hlsManifestUrl → 302, else proxy adaptiveFormats
-//  3. ANDROID native → progressive muxed MP4 (single URL, not IP-locked, no PO token needed)
-//  4. iOS            → hlsManifestUrl → 302 redirect
-//  5. WebEmbedded    → hlsManifestUrl → 302, else proxy adaptiveFormats
-//  6. Android VR     → proxy adaptiveFormats           (last resort)
-//
-// HLS redirect (302) is safe — HLS URLs are NOT IP-locked.
-// adaptiveFormats URLs ARE IP-locked and must be proxied, never 302-redirected.
 async function handleStream(trackId, incomingRequest, env, userToken) {
-  // Helper: proxy an adaptiveFormats URL through the worker (range-aware)
+  // Helper: proxy a CDN URL through the worker (range-aware).
+  // IMPORTANT: content-type is always forced to 'audio/mp4' regardless of the
+  // upstream's real mimeType (even for progressive muxed video/mp4 formats).
+  // Eclipse's player treats this as an audio route — if the header says
+  // "video/mp4" the client refuses to play it even though the audio track
+  // decodes fine. (Verified via prod logs: v2.3.0 broke playback exactly
+  // this way — AndroidNative resolved and returned 200 but nothing played.)
   async function proxyAdaptiveUrl(best, ua, origin) {
     const cdnUrl = best.url.includes('?') ? best.url + '&alr=yes' : best.url + '?alr=yes';
     const reqHeaders = { 'User-Agent': ua, 'Accept': '*/*', 'Origin': origin, 'Referer': origin + '/' };
@@ -863,7 +818,7 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
       throw new Error(`CDN non-audio content-type: ${ct}`);
     }
     const resHeaders = {
-      'content-type': ct.includes('video') ? ct : 'audio/mp4',
+      'content-type': 'audio/mp4',
       'access-control-allow-origin': '*',
       'cache-control': 'no-store',
     };
@@ -875,8 +830,6 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
   }
 
   // ── Step 1: MWEB → hlsManifestUrl ────────────────────────────────────────
-  // Mobile web client — primary replacement for dead TVHTML5.
-  // Lower bot-detection risk from datacenter IPs. Returns hlsManifestUrl.
   try {
     const mwebData = await fetchPlayerDataMWeb(trackId, env);
     const hlsUrl = mwebData?.streamingData?.hlsManifestUrl;
@@ -887,7 +840,6 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
         headers: { 'location': hlsUrl, 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
       });
     }
-    // MWEB responded OK but no HLS — try proxying adaptiveFormats
     const best = pickBestAudio(mwebData?.streamingData);
     if (best) {
       console.log(LOG_PREFIX, `MWEB adaptive proxy for ${trackId}`);
@@ -918,10 +870,6 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
   }
 
   // ── Step 3: ANDROID native → progressive MP4 (muxed, single URL) ────────
-  // Doesn't rely on adaptiveFormats (IP-locked) or HLS (sometimes blocked).
-  // Native app clients are less aggressively bot-checked than the web-based
-  // paths above, and work even when your PO token has expired since native
-  // clients don't gate on it the same way WEB/MWEB do.
   try {
     const androidData = await fetchPlayerDataAndroidNative(trackId, env);
     const progressive = pickProgressiveFormat(androidData?.streamingData);
@@ -991,8 +939,6 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
 }
 
 // /download/{id}
-// Uses the Android Music client whose CDN URLs are directly fetchable server-side.
-// Validates that the upstream response is actually audio before streaming to Eclipse.
 async function proxyDownload(trackId, incomingRequest, env, userToken) {
   const data = await fetchPlayerDataAndroid(trackId, env);
   const sd = data.streamingData;
@@ -1199,7 +1145,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'2.3.0', description:v.description,
+    id:v.id, name:v.name, version:'2.3.1', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
@@ -1319,7 +1265,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   </div>
   <div class="warn">Each URL is unique to your session. Regenerating creates a new URL — old ones keep working.</div>
 </div>
-<footer>YouTube Music for Eclipse &middot; v2.3.0 &middot; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse &middot; v2.3.1 &middot; Cloudflare Workers</footer>
 <script>
 let tok=null,urls={};
 function base(){return location.origin;}
@@ -1361,17 +1307,13 @@ export default {
       });
     }
 
-    // Kick off a background PO token refresh on every request (non-blocking)
-    // Only runs if YT_PO_TOKEN_GENERATOR_URL is set AND Upstash is configured.
     if (env?.YT_PO_TOKEN_GENERATOR_URL && env?.UPSTASH_REDIS_REST_URL) {
       const cached = await upstashCmd(env, 'GET', 'ytm:po_token');
-      if (!cached) tryRefreshPoToken(env); // fire and forget
+      if (!cached) tryRefreshPoToken(env);
     }
 
-    // ── Root: landing page
     if (path === '/' || path === '') return htmlRes(buildPage());
 
-    // ── Token-scoped routes: /u/<token>/...
     const parsed = parseTokenPath(path);
     if (parsed) {
       if (!isValidToken(parsed.token)) return jsonRes({ error: 'Invalid token' }, 400);
@@ -1385,7 +1327,6 @@ export default {
       return jsonRes({ error: 'Not found' }, 404);
     }
 
-    // ── Bare routes (no token): /manifest, /search, /stream/..., etc.
     try {
       const result = await handleRoute(path, url, request, env, null, 'both');
       if (result) return result;
