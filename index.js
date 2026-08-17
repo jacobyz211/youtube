@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.8.0
+// author: ricky | version: 2.9.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY_FALLBACK = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -558,24 +558,49 @@ async function handleSearch(query, env, userToken, mode) {
     }
   }
 
+  if (plR.status==='fulfilled'&&plR.value) for (const s of getShelves(plR.value))
+    for (const it of s.contents||[]){ const p=parsePlaylistItem(it); if(p&&playlists.length<12)playlists.push(p); }
+
+  // ── Per-category backfill (parallel, only for whichever came back empty) ─
+  const needTracks    = fetchSongs && tracks.length===0;
+  const needAlbums    = fetchAlbums && albums.length===0;
+  const needArtists   = artists.length===0;
+  const needPlaylists = playlists.length===0;
+
+  if (needTracks || needAlbums || needArtists || needPlaylists) {
+    const [tFB, aFB, arFB, pFB] = await Promise.allSettled([
+      needTracks    ? ytmSearchAndroid(query, SEARCH_PARAMS.songs,     env) : Promise.resolve(null),
+      needAlbums    ? ytmSearchAndroid(query, SEARCH_PARAMS.albums,    env) : Promise.resolve(null),
+      needArtists   ? ytmSearchAndroid(query, SEARCH_PARAMS.artists,   env) : Promise.resolve(null),
+      needPlaylists ? ytmSearchAndroid(query, SEARCH_PARAMS.playlists, env) : Promise.resolve(null),
+    ]);
+
+    if (needTracks && tFB.status==='fulfilled' && tFB.value)
+      for (const s of getShelves(tFB.value))
+        for (const it of s.contents||[]){ addTrack(parseTrackRenderer(it.musicResponsiveListItemRenderer)); if(tracks.length>=40)break; }
+
+    if (needAlbums && aFB.status==='fulfilled' && aFB.value)
+      for (const s of getShelves(aFB.value))
+        for (const it of s.contents||[]){ const a=parseAlbumItem(it); if(a&&albums.length<15)albums.push(a); }
+
+    if (needArtists && arFB.status==='fulfilled' && arFB.value)
+      for (const s of getShelves(arFB.value))
+        for (const it of s.contents||[]){
+          const a=parseArtistItem(it);
+          if(a&&!seenArtistIds.has(a.id)&&artists.length<12){ seenArtistIds.add(a.id); artists.push(a); }
+        }
+
+    if (needPlaylists && pFB.status==='fulfilled' && pFB.value)
+      for (const s of getShelves(pFB.value))
+        for (const it of s.contents||[]){ const p=parsePlaylistItem(it); if(p&&playlists.length<12)playlists.push(p); }
+
+    console.log(LOG_PREFIX, `category backfill for "${query}": tracks=${needTracks} albums=${needAlbums} artists=${needArtists} playlists=${needPlaylists}`);
+  }
+
   if (artists.length===0) {
     const ytChannels=await ytDataChannelSearch(query,env);
     for (const ch of ytChannels)
       if (!seenArtistIds.has(ch.id)&&artists.length<12){ seenArtistIds.add(ch.id); artists.push(ch); }
-  }
-
-  if (plR.status==='fulfilled'&&plR.value) for (const s of getShelves(plR.value))
-    for (const it of s.contents||[]){ const p=parsePlaylistItem(it); if(p&&playlists.length<12)playlists.push(p); }
-
-  if (tracks.length===0 && albums.length===0 && artists.length===0 && playlists.length===0) {
-    try {
-      const androidData = await ytmSearchAndroid(query, SEARCH_PARAMS.songs, env);
-      for (const s of getShelves(androidData))
-        for (const it of s.contents||[]){ addTrack(parseTrackRenderer(it.musicResponsiveListItemRenderer)); if(tracks.length>=40)break; }
-      console.log(LOG_PREFIX, `search fallback (ANDROID_MUSIC) recovered ${tracks.length} tracks for "${query}"`);
-    } catch(e) {
-      console.log(LOG_PREFIX, 'search fallback failed:', e.message);
-    }
   }
 
   return { tracks, albums, artists, playlists };
@@ -775,16 +800,6 @@ function pickBestAudio(sd) {
     .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 
-// Sort ascending by bitrate and take the smallest muxed avc1+mp4a match.
-// Previously this used .find(), which just grabbed whichever matching
-// format happened to be first in YouTube's array — sometimes that was the
-// small/fast legacy 360p-ish itag (plays instantly, shows as "avc1 ~69kbps"
-// in Eclipse's own player once it inspects the file), other times a larger,
-// higher-bitrate progressive format that takes longer to buffer before
-// playback starts — that's the "shows mp4 for a second then catches up to
-// avc1 quality" delay being reported. Always picking the smallest available
-// muxed format makes start time consistent for every track: the video track
-// is discarded by the player anyway, so there's no real quality tradeoff.
 function pickProgressiveFormat(sd) {
   const formats = sd?.formats || [];
   const candidates = formats
@@ -793,95 +808,69 @@ function pickProgressiveFormat(sd) {
   return candidates[0] || null;
 }
 
+async function resolveAndroidNative(trackId, env) {
+  const data = await fetchPlayerDataAndroidNative(trackId, env);
+  const progressive = pickProgressiveFormat(data?.streamingData);
+  if (progressive?.url) return { url: progressive.url, format: 'mp4', quality: 'native' };
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  throw new Error('no usable format');
+}
+async function resolveIOS(trackId, env, userToken) {
+  const data = await fetchPlayerData(trackId, env, userToken);
+  const hlsUrl = data?.streamingData?.hlsManifestUrl;
+  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  throw new Error('no HLS');
+}
+async function resolveMWeb(trackId, env) {
+  const data = await fetchPlayerDataMWeb(trackId, env);
+  const hlsUrl = data?.streamingData?.hlsManifestUrl;
+  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  throw new Error('no usable format');
+}
+async function resolveWebCreator(trackId, env) {
+  const data = await fetchPlayerDataWebCreator(trackId, env);
+  const hlsUrl = data?.streamingData?.hlsManifestUrl;
+  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  throw new Error('no usable format');
+}
+async function resolveWebEmbedded(trackId, env) {
+  const data = await fetchPlayerDataWebEmbedded(trackId, env);
+  const hlsUrl = data?.streamingData?.hlsManifestUrl;
+  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  throw new Error('no usable format');
+}
+async function resolveAndroidVR(trackId, env) {
+  const data = await fetchPlayerDataAndroidVR(trackId, env);
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  throw new Error('no usable format');
+}
+
 async function handleStream(trackId, env, userToken) {
-  try {
-    const androidData = await fetchPlayerDataAndroidNative(trackId, env);
-    const progressive = pickProgressiveFormat(androidData?.streamingData);
-    if (progressive?.url) {
-      console.log(LOG_PREFIX, `AndroidNative progressive resolved for ${trackId}`);
-      return { url: progressive.url, format: 'mp4', quality: 'native' };
+  const resolvers = [
+    { name: 'AndroidNative', run: () => resolveAndroidNative(trackId, env) },
+    { name: 'iOS',           run: () => resolveIOS(trackId, env, userToken) },
+    { name: 'MWEB',          run: () => resolveMWeb(trackId, env) },
+    { name: 'WebCreator',    run: () => resolveWebCreator(trackId, env) },
+    { name: 'WebEmbedded',   run: () => resolveWebEmbedded(trackId, env) },
+    { name: 'AndroidVR',     run: () => resolveAndroidVR(trackId, env) },
+  ];
+  const settled = await Promise.allSettled(resolvers.map(r => r.run()));
+  for (let i = 0; i < resolvers.length; i++) {
+    const s = settled[i];
+    if (s.status === 'fulfilled') {
+      console.log(LOG_PREFIX, `${resolvers[i].name} resolved for ${trackId}`);
+      return s.value;
     }
-    const best = pickBestAudio(androidData?.streamingData);
-    if (best) {
-      console.log(LOG_PREFIX, `AndroidNative adaptive resolved for ${trackId}`);
-      return { url: best.url, format: 'm4a', quality: 'native' };
-    }
-  } catch (androidErr) {
-    console.log(LOG_PREFIX, `AndroidNative failed for ${trackId}: ${androidErr.message}`);
+    console.log(LOG_PREFIX, `${resolvers[i].name} failed for ${trackId}: ${s.reason?.message}`);
   }
-
-  try {
-    const iosData = await fetchPlayerData(trackId, env, userToken);
-    const hlsUrl = iosData?.streamingData?.hlsManifestUrl;
-    if (hlsUrl) {
-      console.log(LOG_PREFIX, `iOS HLS resolved for ${trackId}`);
-      return { url: hlsUrl, format: 'hls', quality: 'auto' };
-    }
-    console.log(LOG_PREFIX, `iOS no HLS for ${trackId} — trying MWEB`);
-  } catch (iosErr) {
-    console.log(LOG_PREFIX, `iOS failed for ${trackId}: ${iosErr.message}`);
-  }
-
-  try {
-    const mwebData = await fetchPlayerDataMWeb(trackId, env);
-    const hlsUrl = mwebData?.streamingData?.hlsManifestUrl;
-    if (hlsUrl) {
-      console.log(LOG_PREFIX, `MWEB HLS resolved for ${trackId}`);
-      return { url: hlsUrl, format: 'hls', quality: 'auto' };
-    }
-    const best = pickBestAudio(mwebData?.streamingData);
-    if (best) {
-      console.log(LOG_PREFIX, `MWEB adaptive resolved for ${trackId}`);
-      return { url: best.url, format: 'm4a', quality: 'native' };
-    }
-  } catch (mwebErr) {
-    console.log(LOG_PREFIX, `MWEB failed for ${trackId}: ${mwebErr.message}`);
-  }
-
-  try {
-    const creatorData = await fetchPlayerDataWebCreator(trackId, env);
-    const hlsUrl = creatorData?.streamingData?.hlsManifestUrl;
-    if (hlsUrl) {
-      console.log(LOG_PREFIX, `WebCreator HLS resolved for ${trackId}`);
-      return { url: hlsUrl, format: 'hls', quality: 'auto' };
-    }
-    const best = pickBestAudio(creatorData?.streamingData);
-    if (best) {
-      console.log(LOG_PREFIX, `WebCreator adaptive resolved for ${trackId}`);
-      return { url: best.url, format: 'm4a', quality: 'native' };
-    }
-  } catch (creatorErr) {
-    console.log(LOG_PREFIX, `WebCreator failed for ${trackId}: ${creatorErr.message}`);
-  }
-
-  try {
-    const webData = await fetchPlayerDataWebEmbedded(trackId, env);
-    const hlsUrl = webData?.streamingData?.hlsManifestUrl;
-    if (hlsUrl) {
-      console.log(LOG_PREFIX, `WebEmbedded HLS resolved for ${trackId}`);
-      return { url: hlsUrl, format: 'hls', quality: 'auto' };
-    }
-    const best = pickBestAudio(webData?.streamingData);
-    if (best) {
-      console.log(LOG_PREFIX, `WebEmbedded adaptive resolved for ${trackId}`);
-      return { url: best.url, format: 'm4a', quality: 'native' };
-    }
-  } catch (webErr) {
-    console.log(LOG_PREFIX, `WebEmbedded failed for ${trackId}: ${webErr.message}`);
-  }
-
-  try {
-    const vrData = await fetchPlayerDataAndroidVR(trackId, env);
-    const best = pickBestAudio(vrData?.streamingData);
-    if (best) {
-      console.log(LOG_PREFIX, `AndroidVR adaptive resolved for ${trackId}`);
-      return { url: best.url, format: 'm4a', quality: 'native' };
-    }
-    throw new Error('no audio format from AndroidVR client');
-  } catch (vrErr) {
-    console.log(LOG_PREFIX, `AndroidVR failed for ${trackId}: ${vrErr.message}`);
-  }
-
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
 }
 
@@ -1027,6 +1016,24 @@ async function handleArtist(artistId, env, userToken, mode) {
   }
 
   let topTracks=rawTracks;
+
+  if (topTracks.length===0) {
+    try {
+      const sr=await ytmSearch(name,SEARCH_PARAMS.songs,env,userToken);
+      const seenIds=new Set(), nameLower=name.toLowerCase();
+      for (const shelf of getShelves(sr))
+        for (const it of shelf.contents||[]){
+          const t=parseTrackRenderer(it.musicResponsiveListItemRenderer,name,'','');
+          if(t&&!seenIds.has(t.id)){
+            if(!t.artist||t.artist.toLowerCase().includes(nameLower)||nameLower.includes(t.artist.toLowerCase()))
+              { seenIds.add(t.id); topTracks.push(t); }
+          }
+          if(topTracks.length>=15)break;
+        }
+      console.log(LOG_PREFIX, `artist top-tracks fallback recovered ${topTracks.length} for "${name}"`);
+    } catch(e){ console.log(LOG_PREFIX,'artist top-tracks fallback failed:',e.message); }
+  }
+
   if (topTracks.some(t=>t.duration===0)) {
     try {
       const sr=await ytmSearch(name,SEARCH_PARAMS.songs,env,userToken);
@@ -1082,7 +1089,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'2.8.0', description:v.description,
+    id:v.id, name:v.name, version:'2.9.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
@@ -1202,7 +1209,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   </div>
   <div class="warn">Each URL is unique to your session. Regenerating creates a new URL — old ones keep working.</div>
 </div>
-<footer>YouTube Music for Eclipse &middot; v2.8.0 &middot; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse &middot; v2.9.0 &middot; Cloudflare Workers</footer>
 <script>
 let tok=null,urls={};
 function base(){return location.origin;}
