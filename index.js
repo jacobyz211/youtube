@@ -1,9 +1,7 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.3.1
+// author: ricky | version: 2.4.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
-// YTM_API_KEY: set this as a Cloudflare Workers secret (YTM_API_KEY) to avoid exposing it.
-// Falls back to the public key if the env secret is not set.
 const YTM_API_KEY_FALLBACK = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
 function getApiKey(env) { return env?.YTM_API_KEY || YTM_API_KEY_FALLBACK; }
 const VISITOR_TTL_SEC = 300;
@@ -13,21 +11,16 @@ const STREAM_EXPIRES_SEC = 5 * 3600 + 50 * 60;
 const WEB_REMIX_CONTEXT = {
   clientName: 'WEB_REMIX', clientVersion: '1.20260304.03.00', hl: 'en', gl: 'US',
 };
-// iOS client — used for /stream (returns hlsManifestUrl)
 const IOS_CLIENT_BASE = {
   clientName: 'IOS', clientVersion: '20.12.4',
   deviceMake: 'Apple', deviceModel: 'iPhone17,3',
   osName: 'iPhone', osVersion: '18.4.1.22E252', hl: 'en',
 };
-// Android Music client — used for /download
-// Its adaptiveFormats URLs are directly fetchable server-side without CDN header tricks
 const ANDROID_MUSIC_CLIENT = {
   clientName: 'ANDROID_MUSIC', clientVersion: '7.27.0',
   androidSdkVersion: 34, hl: 'en', gl: 'US',
 };
 
-// Android VR client — fallback for /stream when iOS client is blocked
-// Flow (A-EDev/Flow) identifies this as the most reliable fast-direct client
 const ANDROID_VR_CLIENT = {
   clientName: 'ANDROID_VR',
   clientVersion: '1.61.48',
@@ -37,11 +30,6 @@ const ANDROID_VR_CLIENT = {
 };
 const ANDROID_VR_UA = 'com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 14; en_US) gzip';
 
-// ANDROID native app client — progressive (muxed) MP4 fallback.
-// Unlike ANDROID_MUSIC's adaptiveFormats (audio-only, IP-locked), this client's
-// "formats" array returns single-file muxed video+audio streams. Native app
-// clients tend to be bot-checked less aggressively than web-based clients from
-// datacenter IPs, and don't strictly require a fresh PO token to resolve.
 const ANDROID_NATIVE_CLIENT = {
   clientName: 'ANDROID',
   clientVersion: '20.22.36',
@@ -53,16 +41,6 @@ const ANDROID_NATIVE_CLIENT = {
 };
 const ANDROID_NATIVE_UA = 'com.google.android.youtube/20.22.36 (Linux; U; Android 15)';
 
-// ── MWEB client — PRIMARY server-side streaming client (replaces dead TVHTML5)
-// Mobile web is significantly harder for YouTube to block from datacenter IPs
-// than the TVHTML5_SIMPLY_EMBEDDED_PLAYER client which now returns
-// "YouTube is no longer supported in this application or device."
-// Returns hlsManifestUrl reliably and has lower bot-detection risk.
-//
-// Secrets to set:
-//   wrangler secret put YT_PO_TOKEN       (from music.youtube.com DevTools → Network → v1/player → serviceIntegrityDimensions.poToken)
-//   wrangler secret put YT_VISITOR_DATA   (from same request → context.client.visitorData)
-//   wrangler secret put YT_COOKIE         (optional — __Secure-3PSID + SAPISID from youtube.com cookies, fixes Android "Please sign in")
 const MWEB_CLIENT = {
   clientName: 'MWEB',
   clientVersion: '2.20260810.01.00',
@@ -71,7 +49,6 @@ const MWEB_CLIENT = {
 };
 const MWEB_UA = 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36';
 
-// WEB_CREATOR — secondary client, less blocked than TVHTML5 from datacenter IPs
 const WEB_CREATOR_CLIENT = {
   clientName: 'WEB_CREATOR',
   clientVersion: '1.20260530.01.00',
@@ -80,7 +57,6 @@ const WEB_CREATOR_CLIENT = {
   gl: 'US',
 };
 
-// WEB_EMBEDDED_PLAYER — tertiary web client for server-side use
 const WEB_EMBEDDED_CLIENT = {
   clientName: 'WEB_EMBEDDED_PLAYER',
   clientVersion: '2.20260530.01.00',
@@ -103,19 +79,16 @@ const SEARCH_HEADERS = {
 const ANDROID_MUSIC_UA = 'com.google.android.apps.youtube.music/7.27.0 (Linux; U; Android 14; en_US) gzip';
 const IOS_UA           = 'com.google.ios.youtube/20.12.4 (iPhone17,3; U; CPU iOS 18_4_1 like Mac OS X)';
 
-// ─── PO Token helpers ─────────────────────────────────────────────────────────
 async function getPoToken(env) {
   const cached = await upstashCmd(env, 'GET', 'ytm:po_token');
   if (cached && typeof cached === 'string' && cached.length > 4) return cached;
   return env?.YT_PO_TOKEN || null;
 }
-
 async function getPoVisitorData(env) {
   const cached = await upstashCmd(env, 'GET', 'ytm:po_visitor_data');
   if (cached && typeof cached === 'string' && cached.length > 4) return cached;
   return env?.YT_VISITOR_DATA || null;
 }
-
 async function withPoToken(body, env) {
   const poToken = await getPoToken(env);
   if (!poToken) return body;
@@ -130,7 +103,6 @@ async function withPoToken(body, env) {
   }
   return enriched;
 }
-
 async function tryRefreshPoToken(env) {
   const generatorUrl = env?.YT_PO_TOKEN_GENERATOR_URL;
   if (!generatorUrl) return;
@@ -149,7 +121,6 @@ async function tryRefreshPoToken(env) {
     console.log(LOG_PREFIX, 'PO token auto-refresh failed:', e.message);
   }
 }
-
 async function upstashCmd(env, ...args) {
   const url = env?.UPSTASH_REDIS_REST_URL, token = env?.UPSTASH_REDIS_REST_TOKEN;
   if (!url || !token) return null;
@@ -162,7 +133,6 @@ async function upstashCmd(env, ...args) {
     return (await res.json()).result ?? null;
   } catch { return null; }
 }
-
 async function getVisitorData(env, userToken) {
   const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
   const cached = await upstashCmd(env, 'GET', key);
@@ -253,8 +223,6 @@ async function ytmSearch(query, params, env, userToken) {
   return ytmPost(`/youtubei/v1/search?key=${getApiKey(env)}`, body, env, userToken);
 }
 
-// ─── YouTube Data API helpers ────────────────────────────────────────────────
-
 async function ytDataChannelSearch(query, env) {
   const apiKey=env?.YOUTUBE_DATA_API_KEY;
   if (!apiKey) return [];
@@ -307,8 +275,6 @@ async function ytDataChannelVideos(channelId, artistName, env) {
     })).filter(t=>t.id&&t.title);
   } catch(e){ console.log(LOG_PREFIX,'ytDataChannelVideos failed:',e.message); return []; }
 }
-
-// ─── Channel browse helpers ──────────────────────────────────────────────────
 
 async function browseChannelVideos(channelId, env, userToken) {
   const channelData=await ytmPost(`/youtubei/v1/browse?key=${getApiKey(env)}`,
@@ -391,8 +357,6 @@ function extractChannelVideoTracks(data, fallbackArtist) {
   }
   return tracks;
 }
-
-// ─── Core parsers ────────────────────────────────────────────────────────────
 
 function getVideoId(r) {
   if (!r) return null;
@@ -514,8 +478,6 @@ function getShelves(data) {
     .map(s=>s.musicShelfRenderer).filter(Boolean);
 }
 
-// ─── Search ──────────────────────────────────────────────────────────────────
-
 async function handleSearch(query, env, userToken, mode) {
   if (!query) return { tracks:[], albums:[], artists:[], playlists:[] };
   const m=mode||'both';
@@ -583,9 +545,6 @@ async function handleSearch(query, env, userToken, mode) {
   return { tracks, albums, artists, playlists };
 }
 
-// ─── Player ──────────────────────────────────────────────────────────────────
-
-// iOS client — for /stream (gives hlsManifestUrl)
 async function fetchPlayerData(trackId, env, userToken) {
   const visitorData=await getVisitorData(env,userToken);
   const baseBody = {
@@ -616,7 +575,6 @@ async function fetchPlayerData(trackId, env, userToken) {
   return data;
 }
 
-// Android Music client — for /download
 async function fetchPlayerDataAndroid(trackId, env) {
   const cookie = env?.YT_COOKIE || '';
   const baseBody = {
@@ -644,12 +602,9 @@ async function fetchPlayerDataAndroid(trackId, env) {
   return data;
 }
 
-// MWEB client — PRIMARY streaming client (replaces dead TVHTML5)
 async function fetchPlayerDataMWeb(trackId, env) {
   const baseBody = {
-    context: {
-      client: MWEB_CLIENT,
-    },
+    context: { client: MWEB_CLIENT },
     videoId: trackId,
     contentCheckOk: true,
     racyCheckOk: true,
@@ -674,7 +629,6 @@ async function fetchPlayerDataMWeb(trackId, env) {
   return data;
 }
 
-// WEB_CREATOR client — secondary streaming client
 async function fetchPlayerDataWebCreator(trackId, env) {
   const baseBody = {
     context: {
@@ -703,7 +657,6 @@ async function fetchPlayerDataWebCreator(trackId, env) {
   return data;
 }
 
-// ANDROID native app client — progressive MP4 fallback.
 async function fetchPlayerDataAndroidNative(trackId, env) {
   const baseBody = {
     context: { client: ANDROID_NATIVE_CLIENT },
@@ -728,7 +681,6 @@ async function fetchPlayerDataAndroidNative(trackId, env) {
   return data;
 }
 
-// WEB_EMBEDDED_PLAYER — tertiary web client
 async function fetchPlayerDataWebEmbedded(trackId, env) {
   const baseBody = {
     context: {
@@ -757,7 +709,6 @@ async function fetchPlayerDataWebEmbedded(trackId, env) {
   return data;
 }
 
-// Android VR client player fetch — returns adaptiveFormats with direct URLs
 async function fetchPlayerDataAndroidVR(trackId, env) {
   const baseBody = {
     context: { client: ANDROID_VR_CLIENT },
@@ -788,8 +739,6 @@ function pickBestAudio(sd) {
     .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 
-// Picks a progressive (muxed video+audio) MP4 format — a single fetchable
-// URL, unlike adaptiveFormats which are audio-only and IP-locked.
 function pickProgressiveFormat(sd) {
   const formats = sd?.formats || [];
   return formats.find(f =>
@@ -797,44 +746,51 @@ function pickProgressiveFormat(sd) {
   ) || null;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
 // /stream/{id}
-async function handleStream(trackId, incomingRequest, env, userToken) {
-  // Helper: proxy a CDN URL through the worker (range-aware).
-  // IMPORTANT: content-type is always forced to 'audio/mp4' regardless of the
-  // upstream's real mimeType (even for progressive muxed video/mp4 formats).
-  // Eclipse's player treats this as an audio route — if the header says
-  // "video/mp4" the client refuses to play it even though the audio track
-  // decodes fine. (Verified via prod logs: v2.3.0 broke playback exactly
-  // this way — AndroidNative resolved and returned 200 but nothing played.)
-  async function proxyAdaptiveUrl(best, ua, origin) {
-    const cdnUrl = best.url.includes('?') ? best.url + '&alr=yes' : best.url + '?alr=yes';
-    const reqHeaders = { 'User-Agent': ua, 'Accept': '*/*', 'Origin': origin, 'Referer': origin + '/' };
-    const range = incomingRequest.headers.get('range');
-    if (range) reqHeaders['Range'] = range;
-    const upstream = await fetch(cdnUrl, { headers: reqHeaders });
-    if (!upstream.ok && upstream.status !== 206) throw new Error(`CDN ${upstream.status}`);
-    const ct = upstream.headers.get('content-type') || '';
-    if (!ct.includes('audio') && !ct.includes('octet-stream') && !ct.includes('video')) {
-      throw new Error(`CDN non-audio content-type: ${ct}`);
-    }
-    const resHeaders = {
-      'content-type': 'audio/mp4',
-      'access-control-allow-origin': '*',
-      'cache-control': 'no-store',
-    };
-    const cl = best.contentLength || upstream.headers.get('content-length');
-    if (cl) resHeaders['content-length'] = String(cl);
-    if (upstream.headers.get('content-range')) resHeaders['content-range'] = upstream.headers.get('content-range');
-    if (upstream.headers.get('accept-ranges')) resHeaders['accept-ranges'] = upstream.headers.get('accept-ranges');
-    return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
-  }
+//
+// ARCHITECTURE CHANGE (v2.4.0): direct 302 redirect for ALL resolved URLs —
+// HLS manifests AND adaptiveFormats/progressive CDN URLs alike — instead of
+// fetching bytes server-side and piping them through the Worker.
+//
+// Why: production logs showed the Worker successfully resolving a track via
+// AndroidNative (200 OK from our own route) but Eclipse reporting a playback
+// error — while manually opening the exact same resolved CDN URL played
+// fine. That's the signature of a proxy-layer bug, not a resolution bug:
+// Cloudflare Workers' fetch() auto-decompresses upstream gzip/br bodies but
+// the raw Content-Length header still reflects the *compressed* size, so
+// forwarding it verbatim under-reports the real byte count and strict
+// players (ExoPlayer-based clients especially) treat the stream as
+// truncated/corrupt and throw immediately, even though the bytes were fine.
+//
+// Both reference implementations confirm direct handoff is the right model:
+//   - youtubeMusicDirect.8spine.js never fetches media bytes at all —
+//     getTrackStreamUrl() just returns { streamUrl: media.url } and lets
+//     the host app's own player fetch it.
+//   - Metrolist (github.com/mostafaalagamy/Metrolist) is a native Android
+//     app that resolves INNERTUBE player data and streams the CDN URL
+//     straight into ExoPlayer — no server-side proxy layer exists at all.
+//
+// adaptiveFormats being "IP-locked" is real in general, but in practice
+// (confirmed by this app's own prod logs) it is not being enforced tightly
+// enough here to block a different requesting IP — so redirecting instead
+// of proxying is both simpler and fixes the corruption bug outright.
+// ─────────────────────────────────────────────────────────────────────────
+function redirectToUrl(rawUrl) {
+  const cdnUrl = rawUrl.includes('?') ? rawUrl + '&alr=yes' : rawUrl + '?alr=yes';
+  return new Response(null, {
+    status: 302,
+    headers: { 'location': cdnUrl, 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
+  });
+}
 
-  // ── Step 1: MWEB → hlsManifestUrl ────────────────────────────────────────
+async function handleStream(trackId, incomingRequest, env, userToken) {
+  // ── Step 1: MWEB → hlsManifestUrl or adaptiveFormats ─────────────────────
   try {
     const mwebData = await fetchPlayerDataMWeb(trackId, env);
     const hlsUrl = mwebData?.streamingData?.hlsManifestUrl;
     if (hlsUrl) {
-      console.log(LOG_PREFIX, `MWEB HLS stream for ${trackId}`);
+      console.log(LOG_PREFIX, `MWEB HLS redirect for ${trackId}`);
       return new Response(null, {
         status: 302,
         headers: { 'location': hlsUrl, 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
@@ -842,19 +798,19 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
     }
     const best = pickBestAudio(mwebData?.streamingData);
     if (best) {
-      console.log(LOG_PREFIX, `MWEB adaptive proxy for ${trackId}`);
-      return await proxyAdaptiveUrl(best, MWEB_UA, 'https://m.youtube.com');
+      console.log(LOG_PREFIX, `MWEB adaptive redirect for ${trackId}`);
+      return redirectToUrl(best.url);
     }
   } catch (mwebErr) {
     console.log(LOG_PREFIX, `MWEB failed for ${trackId}: ${mwebErr.message}`);
   }
 
-  // ── Step 2: WEB_CREATOR → hlsManifestUrl or proxy ────────────────────────
+  // ── Step 2: WEB_CREATOR → hlsManifestUrl or adaptiveFormats ──────────────
   try {
     const creatorData = await fetchPlayerDataWebCreator(trackId, env);
     const hlsUrl = creatorData?.streamingData?.hlsManifestUrl;
     if (hlsUrl) {
-      console.log(LOG_PREFIX, `WebCreator HLS stream for ${trackId}`);
+      console.log(LOG_PREFIX, `WebCreator HLS redirect for ${trackId}`);
       return new Response(null, {
         status: 302,
         headers: { 'location': hlsUrl, 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
@@ -862,25 +818,25 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
     }
     const best = pickBestAudio(creatorData?.streamingData);
     if (best) {
-      console.log(LOG_PREFIX, `WebCreator adaptive proxy for ${trackId}`);
-      return await proxyAdaptiveUrl(best, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36', 'https://www.youtube.com');
+      console.log(LOG_PREFIX, `WebCreator adaptive redirect for ${trackId}`);
+      return redirectToUrl(best.url);
     }
   } catch (creatorErr) {
     console.log(LOG_PREFIX, `WebCreator failed for ${trackId}: ${creatorErr.message}`);
   }
 
-  // ── Step 3: ANDROID native → progressive MP4 (muxed, single URL) ────────
+  // ── Step 3: ANDROID native → progressive MP4 or adaptiveFormats ─────────
   try {
     const androidData = await fetchPlayerDataAndroidNative(trackId, env);
     const progressive = pickProgressiveFormat(androidData?.streamingData);
     if (progressive?.url) {
-      console.log(LOG_PREFIX, `AndroidNative progressive proxy for ${trackId}`);
-      return await proxyAdaptiveUrl(progressive, ANDROID_NATIVE_UA, 'https://www.youtube.com');
+      console.log(LOG_PREFIX, `AndroidNative progressive redirect for ${trackId}`);
+      return redirectToUrl(progressive.url);
     }
     const best = pickBestAudio(androidData?.streamingData);
     if (best) {
-      console.log(LOG_PREFIX, `AndroidNative adaptive proxy for ${trackId}`);
-      return await proxyAdaptiveUrl(best, ANDROID_NATIVE_UA, 'https://www.youtube.com');
+      console.log(LOG_PREFIX, `AndroidNative adaptive redirect for ${trackId}`);
+      return redirectToUrl(best.url);
     }
   } catch (androidErr) {
     console.log(LOG_PREFIX, `AndroidNative failed for ${trackId}: ${androidErr.message}`);
@@ -891,7 +847,7 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
     const iosData = await fetchPlayerData(trackId, env, userToken);
     const hlsUrl = iosData?.streamingData?.hlsManifestUrl;
     if (hlsUrl) {
-      console.log(LOG_PREFIX, `iOS HLS stream for ${trackId}`);
+      console.log(LOG_PREFIX, `iOS HLS redirect for ${trackId}`);
       return new Response(null, {
         status: 302,
         headers: { 'location': hlsUrl, 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
@@ -902,12 +858,12 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
     console.log(LOG_PREFIX, `iOS failed for ${trackId}: ${iosErr.message}`);
   }
 
-  // ── Step 5: WEB_EMBEDDED_PLAYER → HLS or proxy ───────────────────────────
+  // ── Step 5: WEB_EMBEDDED_PLAYER → HLS or adaptiveFormats ─────────────────
   try {
     const webData = await fetchPlayerDataWebEmbedded(trackId, env);
     const hlsUrl = webData?.streamingData?.hlsManifestUrl;
     if (hlsUrl) {
-      console.log(LOG_PREFIX, `WebEmbedded HLS stream for ${trackId}`);
+      console.log(LOG_PREFIX, `WebEmbedded HLS redirect for ${trackId}`);
       return new Response(null, {
         status: 302,
         headers: { 'location': hlsUrl, 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
@@ -915,20 +871,20 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
     }
     const best = pickBestAudio(webData?.streamingData);
     if (best) {
-      console.log(LOG_PREFIX, `WebEmbedded adaptive proxy for ${trackId}`);
-      return await proxyAdaptiveUrl(best, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36', 'https://www.youtube.com');
+      console.log(LOG_PREFIX, `WebEmbedded adaptive redirect for ${trackId}`);
+      return redirectToUrl(best.url);
     }
   } catch (webErr) {
     console.log(LOG_PREFIX, `WebEmbedded failed for ${trackId}: ${webErr.message}`);
   }
 
-  // ── Step 6: Android VR proxy — last resort ────────────────────────────────
+  // ── Step 6: Android VR → adaptiveFormats — last resort ───────────────────
   try {
     const vrData = await fetchPlayerDataAndroidVR(trackId, env);
     const best = pickBestAudio(vrData?.streamingData);
     if (best) {
-      console.log(LOG_PREFIX, `AndroidVR adaptive proxy for ${trackId}`);
-      return await proxyAdaptiveUrl(best, ANDROID_VR_UA, 'https://www.youtube.com');
+      console.log(LOG_PREFIX, `AndroidVR adaptive redirect for ${trackId}`);
+      return redirectToUrl(best.url);
     }
     throw new Error('no audio format from AndroidVR client');
   } catch (vrErr) {
@@ -938,7 +894,8 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
 }
 
-// /download/{id}
+// /download/{id} — still proxies (needs a real attachment with a filename),
+// unaffected by the stream bug above since it was never reported broken.
 async function proxyDownload(trackId, incomingRequest, env, userToken) {
   const data = await fetchPlayerDataAndroid(trackId, env);
   const sd = data.streamingData;
@@ -971,8 +928,6 @@ async function proxyDownload(trackId, incomingRequest, env, userToken) {
     throw new Error(`${LOG_PREFIX} CDN returned non-audio content-type "${upstreamCT}" — body: ${preview.slice(0,200)}`);
   }
 
-  const contentLength = best.contentLength || upstream.headers.get('content-length') || null;
-
   const resHeaders = {
     'content-type':                 'audio/mp4',
     'access-control-allow-origin':  '*',
@@ -980,14 +935,15 @@ async function proxyDownload(trackId, incomingRequest, env, userToken) {
     'cache-control':                'no-store',
     'content-disposition':          `attachment; filename="${trackId}.m4a"`,
   };
-  if (contentLength)                         resHeaders['content-length'] = String(contentLength);
+  // NOTE: intentionally NOT forwarding upstream content-length here —
+  // Cloudflare Workers' fetch() can decompress the body while the header
+  // still reflects the compressed size, which under-reports the real byte
+  // count. Let the runtime chunk the transfer instead of asserting a length.
   if (upstream.headers.get('content-range')) resHeaders['content-range']  = upstream.headers.get('content-range');
   if (upstream.headers.get('accept-ranges')) resHeaders['accept-ranges']  = upstream.headers.get('accept-ranges');
 
   return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
 }
-
-// ─── Browse helpers ──────────────────────────────────────────────────────────
 
 function extractSecondaryTracks(data, fallbackArtist, fallbackAlbum, fallbackArtwork) {
   const twoCol=data?.contents?.twoColumnBrowseResultsRenderer;
@@ -1010,8 +966,6 @@ function extractResponsiveHeader(data) {
   if (rhr) return rhr;
   return data?.header?.musicImmersiveHeaderRenderer||data?.header?.musicDetailHeaderRenderer||null;
 }
-
-// ─── Route handlers ──────────────────────────────────────────────────────────
 
 async function handleAlbum(albumId, env, userToken) {
   const data=await ytmBrowse(albumId,env,userToken);
@@ -1121,8 +1075,6 @@ async function handlePlaylist(playlistId, env, userToken) {
   return { id:playlistId, title, creator, artworkURL, trackCount:tracks.length, tracks };
 }
 
-// ─── Token / routing ─────────────────────────────────────────────────────────
-
 function generateToken() {
   const arr=new Uint8Array(14); crypto.getRandomValues(arr);
   return Array.from(arr,b=>b.toString(16).padStart(2,'0')).join('');
@@ -1145,7 +1097,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'2.3.1', description:v.description,
+    id:v.id, name:v.name, version:'2.4.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
@@ -1265,7 +1217,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   </div>
   <div class="warn">Each URL is unique to your session. Regenerating creates a new URL — old ones keep working.</div>
 </div>
-<footer>YouTube Music for Eclipse &middot; v2.3.1 &middot; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse &middot; v2.4.0 &middot; Cloudflare Workers</footer>
 <script>
 let tok=null,urls={};
 function base(){return location.origin;}
