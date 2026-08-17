@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.6.0
+// author: ricky | version: 2.8.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY_FALLBACK = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -211,17 +211,28 @@ async function ytmPost(path, body, env, userToken) {
   return data;
 }
 async function ytmBrowse(browseId, env, userToken) {
-  return ytmPost(`/youtubei/v1/browse?key=${getApiKey(env)}`,
-    { context:{client:WEB_REMIX_CONTEXT}, browseId }, env, userToken);
+  try {
+    return await ytmPost(`/youtubei/v1/browse?key=${getApiKey(env)}`,
+      { context:{client:WEB_REMIX_CONTEXT}, browseId }, env, userToken);
+  } catch (e) {
+    console.log(LOG_PREFIX, `ytmBrowse WEB_REMIX failed (${e.message}), retrying with ANDROID_MUSIC`);
+    const resp = await fetch(`${YTM_BASE}/youtubei/v1/browse?key=${getApiKey(env)}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': ANDROID_MUSIC_UA,
+      },
+      body: JSON.stringify({ context: { client: ANDROID_MUSIC_CLIENT }, browseId }),
+    });
+    if (!resp.ok) throw new Error(`${LOG_PREFIX} HTTP ${resp.status} on browse (both clients failed)`);
+    return resp.json();
+  }
 }
 async function ytmSearch(query, params, env, userToken) {
   const body={context:{client:WEB_REMIX_CONTEXT}, query};
   if (params) body.params=params;
   return ytmPost(`/youtubei/v1/search?key=${getApiKey(env)}`, body, env, userToken);
 }
-// Secondary search path — ANDROID_MUSIC client, used only as a fallback when
-// the WEB_REMIX-based search above comes back completely empty (bot-check
-// or transient failure on that specific client rather than the whole IP).
 async function ytmSearchAndroid(query, params, env) {
   const body = { context: { client: ANDROID_MUSIC_CLIENT }, query };
   if (params) body.params = params;
@@ -556,10 +567,6 @@ async function handleSearch(query, env, userToken, mode) {
   if (plR.status==='fulfilled'&&plR.value) for (const s of getShelves(plR.value))
     for (const it of s.contents||[]){ const p=parsePlaylistItem(it); if(p&&playlists.length<12)playlists.push(p); }
 
-  // Fallback: if the WEB_REMIX-based search came back completely empty
-  // (all six parallel calls failed or returned nothing), retry once using
-  // the ANDROID_MUSIC client. This handles cases where WEB_REMIX specifically
-  // is being bot-checked but other clients still work.
   if (tracks.length===0 && albums.length===0 && artists.length===0 && playlists.length===0) {
     try {
       const androidData = await ytmSearchAndroid(query, SEARCH_PARAMS.songs, env);
@@ -768,33 +775,25 @@ function pickBestAudio(sd) {
     .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 
+// Sort ascending by bitrate and take the smallest muxed avc1+mp4a match.
+// Previously this used .find(), which just grabbed whichever matching
+// format happened to be first in YouTube's array — sometimes that was the
+// small/fast legacy 360p-ish itag (plays instantly, shows as "avc1 ~69kbps"
+// in Eclipse's own player once it inspects the file), other times a larger,
+// higher-bitrate progressive format that takes longer to buffer before
+// playback starts — that's the "shows mp4 for a second then catches up to
+// avc1 quality" delay being reported. Always picking the smallest available
+// muxed format makes start time consistent for every track: the video track
+// is discarded by the player anyway, so there's no real quality tradeoff.
 function pickProgressiveFormat(sd) {
   const formats = sd?.formats || [];
-  return formats.find(f =>
-    f.url && f.mimeType && f.mimeType.startsWith('video/mp4') && f.mimeType.includes('mp4a')
-  ) || null;
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// /stream/{id}
-//
-// ARCHITECTURE FIX (v2.6.0): reordered the cascade based on real production
-// data. Logs showed MWEB and WEB_CREATOR failing on essentially every single
-// request ("page needs to be reloaded" / "Please sign in") while
-// AndroidNative succeeded most of the time — but AndroidNative was Step 3,
-// so every successful resolution still paid for two guaranteed-failed round
-// trips first, and full failures paid for six. That's the entire source of
-// the 5-30 second stalls reported. AndroidNative now goes first; MWEB and
-// WebCreator are demoted to later fallbacks since they're currently dead
-// weight for this app's traffic pattern (worth revisiting if YouTube
-// changes behavior again — check wrangler tail periodically).
-// ─────────────────────────────────────────────────────────────────────────
-function redirectHls(hlsUrl) {
-  return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  const candidates = formats
+    .filter(f => f.url && f.mimeType && f.mimeType.startsWith('video/mp4') && f.mimeType.includes('mp4a'))
+    .sort((a, b) => (a.bitrate || 0) - (b.bitrate || 0));
+  return candidates[0] || null;
 }
 
 async function handleStream(trackId, env, userToken) {
-  // ── Step 1: ANDROID native → progressive MP4 or adaptiveFormats (primary) ─
   try {
     const androidData = await fetchPlayerDataAndroidNative(trackId, env);
     const progressive = pickProgressiveFormat(androidData?.streamingData);
@@ -811,26 +810,24 @@ async function handleStream(trackId, env, userToken) {
     console.log(LOG_PREFIX, `AndroidNative failed for ${trackId}: ${androidErr.message}`);
   }
 
-  // ── Step 2: iOS → hlsManifestUrl ─────────────────────────────────────────
   try {
     const iosData = await fetchPlayerData(trackId, env, userToken);
     const hlsUrl = iosData?.streamingData?.hlsManifestUrl;
     if (hlsUrl) {
       console.log(LOG_PREFIX, `iOS HLS resolved for ${trackId}`);
-      return redirectHls(hlsUrl);
+      return { url: hlsUrl, format: 'hls', quality: 'auto' };
     }
     console.log(LOG_PREFIX, `iOS no HLS for ${trackId} — trying MWEB`);
   } catch (iosErr) {
     console.log(LOG_PREFIX, `iOS failed for ${trackId}: ${iosErr.message}`);
   }
 
-  // ── Step 3: MWEB → hlsManifestUrl or adaptiveFormats ─────────────────────
   try {
     const mwebData = await fetchPlayerDataMWeb(trackId, env);
     const hlsUrl = mwebData?.streamingData?.hlsManifestUrl;
     if (hlsUrl) {
       console.log(LOG_PREFIX, `MWEB HLS resolved for ${trackId}`);
-      return redirectHls(hlsUrl);
+      return { url: hlsUrl, format: 'hls', quality: 'auto' };
     }
     const best = pickBestAudio(mwebData?.streamingData);
     if (best) {
@@ -841,13 +838,12 @@ async function handleStream(trackId, env, userToken) {
     console.log(LOG_PREFIX, `MWEB failed for ${trackId}: ${mwebErr.message}`);
   }
 
-  // ── Step 4: WEB_CREATOR → hlsManifestUrl or adaptiveFormats ──────────────
   try {
     const creatorData = await fetchPlayerDataWebCreator(trackId, env);
     const hlsUrl = creatorData?.streamingData?.hlsManifestUrl;
     if (hlsUrl) {
       console.log(LOG_PREFIX, `WebCreator HLS resolved for ${trackId}`);
-      return redirectHls(hlsUrl);
+      return { url: hlsUrl, format: 'hls', quality: 'auto' };
     }
     const best = pickBestAudio(creatorData?.streamingData);
     if (best) {
@@ -858,13 +854,12 @@ async function handleStream(trackId, env, userToken) {
     console.log(LOG_PREFIX, `WebCreator failed for ${trackId}: ${creatorErr.message}`);
   }
 
-  // ── Step 5: WEB_EMBEDDED_PLAYER → HLS or adaptiveFormats ─────────────────
   try {
     const webData = await fetchPlayerDataWebEmbedded(trackId, env);
     const hlsUrl = webData?.streamingData?.hlsManifestUrl;
     if (hlsUrl) {
       console.log(LOG_PREFIX, `WebEmbedded HLS resolved for ${trackId}`);
-      return redirectHls(hlsUrl);
+      return { url: hlsUrl, format: 'hls', quality: 'auto' };
     }
     const best = pickBestAudio(webData?.streamingData);
     if (best) {
@@ -875,7 +870,6 @@ async function handleStream(trackId, env, userToken) {
     console.log(LOG_PREFIX, `WebEmbedded failed for ${trackId}: ${webErr.message}`);
   }
 
-  // ── Step 6: Android VR → adaptiveFormats — last resort ───────────────────
   try {
     const vrData = await fetchPlayerDataAndroidVR(trackId, env);
     const best = pickBestAudio(vrData?.streamingData);
@@ -891,7 +885,6 @@ async function handleStream(trackId, env, userToken) {
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
 }
 
-// /download/{id} — still proxies real bytes (needs a filename/attachment).
 async function proxyDownload(trackId, incomingRequest, env, userToken) {
   const data = await fetchPlayerDataAndroid(trackId, env);
   const sd = data.streamingData;
@@ -1089,7 +1082,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'2.6.0', description:v.description,
+    id:v.id, name:v.name, version:'2.8.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
@@ -1209,7 +1202,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   </div>
   <div class="warn">Each URL is unique to your session. Regenerating creates a new URL — old ones keep working.</div>
 </div>
-<footer>YouTube Music for Eclipse &middot; v2.6.0 &middot; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse &middot; v2.8.0 &middot; Cloudflare Workers</footer>
 <script>
 let tok=null,urls={};
 function base(){return location.origin;}
