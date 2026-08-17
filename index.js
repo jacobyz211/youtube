@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.2.0
+// author: ricky | version: 2.3.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 // YTM_API_KEY: set this as a Cloudflare Workers secret (YTM_API_KEY) to avoid exposing it.
@@ -36,6 +36,22 @@ const ANDROID_VR_CLIENT = {
   gl: 'US',
 };
 const ANDROID_VR_UA = 'com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 14; en_US) gzip';
+
+// ANDROID native app client — progressive (muxed) MP4 fallback.
+// Unlike ANDROID_MUSIC's adaptiveFormats (audio-only, IP-locked), this client's
+// "formats" array returns single-file muxed video+audio streams. Native app
+// clients tend to be bot-checked less aggressively than web-based clients from
+// datacenter IPs, and don't strictly require a fresh PO token to resolve.
+const ANDROID_NATIVE_CLIENT = {
+  clientName: 'ANDROID',
+  clientVersion: '20.22.36',
+  androidSdkVersion: 35,
+  osName: 'Android',
+  osVersion: '15',
+  hl: 'en',
+  gl: 'US',
+};
+const ANDROID_NATIVE_UA = 'com.google.android.youtube/20.22.36 (Linux; U; Android 15)';
 
 // ── MWEB client — PRIMARY server-side streaming client (replaces dead TVHTML5)
 // Mobile web is significantly harder for YouTube to block from datacenter IPs
@@ -722,6 +738,34 @@ async function fetchPlayerDataWebCreator(trackId, env) {
   return data;
 }
 
+// ANDROID native app client — progressive MP4 fallback.
+// Native app clients are less aggressively bot-checked than WEB/MWEB from
+// datacenter IPs and don't strictly require a fresh PO token to resolve
+// the muxed "formats" array (unlike adaptiveFormats, which is audio-only).
+async function fetchPlayerDataAndroidNative(trackId, env) {
+  const baseBody = {
+    context: { client: ANDROID_NATIVE_CLIENT },
+    videoId: trackId,
+    contentCheckOk: true,
+    racyCheckOk: true,
+  };
+  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': ANDROID_NATIVE_UA,
+      'X-Goog-Api-Format-Version': '2',
+    },
+    body: JSON.stringify(await withPoToken(baseBody, env)),
+  });
+  if (!resp.ok) throw new Error(`${LOG_PREFIX} AndroidNative player HTTP ${resp.status}`);
+  const data = await resp.json();
+  if (data?.playabilityStatus?.status !== 'OK') {
+    throw new Error(`${LOG_PREFIX} AndroidNative blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
+  }
+  return data;
+}
+
 // WEB_EMBEDDED_PLAYER — tertiary web client
 async function fetchPlayerDataWebEmbedded(trackId, env) {
   const baseBody = {
@@ -782,21 +826,30 @@ function pickBestAudio(sd) {
     .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 
+// Picks a progressive (muxed video+audio) MP4 format — a single fetchable
+// URL, unlike adaptiveFormats which are audio-only and IP-locked.
+function pickProgressiveFormat(sd) {
+  const formats = sd?.formats || [];
+  return formats.find(f =>
+    f.url && f.mimeType && f.mimeType.startsWith('video/mp4') && f.mimeType.includes('mp4a')
+  ) || null;
+}
+
 // /stream/{id}
 //
 // Cascade strategy — TVHTML5 is dead from Cloudflare IPs (returns "no longer supported").
 // New cascade uses clients that are harder to bot-detect from datacenter IPs:
 //
-//  1. MWEB          → hlsManifestUrl → 302 redirect  (primary: mobile web, lowest block rate)
-//  2. WEB_CREATOR   → hlsManifestUrl → 302, else proxy adaptiveFormats
-//  3. iOS           → hlsManifestUrl → 302 redirect
-//  4. WebEmbedded   → hlsManifestUrl → 302, else proxy adaptiveFormats
-//  5. Android VR    → proxy adaptiveFormats           (last resort)
+//  1. MWEB           → hlsManifestUrl → 302 redirect  (primary: mobile web, lowest block rate)
+//  2. WEB_CREATOR    → hlsManifestUrl → 302, else proxy adaptiveFormats
+//  3. ANDROID native → progressive muxed MP4 (single URL, not IP-locked, no PO token needed)
+//  4. iOS            → hlsManifestUrl → 302 redirect
+//  5. WebEmbedded    → hlsManifestUrl → 302, else proxy adaptiveFormats
+//  6. Android VR     → proxy adaptiveFormats           (last resort)
 //
 // HLS redirect (302) is safe — HLS URLs are NOT IP-locked.
 // adaptiveFormats URLs ARE IP-locked and must be proxied, never 302-redirected.
 async function handleStream(trackId, incomingRequest, env, userToken) {
-
   // Helper: proxy an adaptiveFormats URL through the worker (range-aware)
   async function proxyAdaptiveUrl(best, ua, origin) {
     const cdnUrl = best.url.includes('?') ? best.url + '&alr=yes' : best.url + '?alr=yes';
@@ -810,7 +863,7 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
       throw new Error(`CDN non-audio content-type: ${ct}`);
     }
     const resHeaders = {
-      'content-type': 'audio/mp4',
+      'content-type': ct.includes('video') ? ct : 'audio/mp4',
       'access-control-allow-origin': '*',
       'cache-control': 'no-store',
     };
@@ -864,7 +917,28 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
     console.log(LOG_PREFIX, `WebCreator failed for ${trackId}: ${creatorErr.message}`);
   }
 
-  // ── Step 3: iOS → hlsManifestUrl ─────────────────────────────────────────
+  // ── Step 3: ANDROID native → progressive MP4 (muxed, single URL) ────────
+  // Doesn't rely on adaptiveFormats (IP-locked) or HLS (sometimes blocked).
+  // Native app clients are less aggressively bot-checked than the web-based
+  // paths above, and work even when your PO token has expired since native
+  // clients don't gate on it the same way WEB/MWEB do.
+  try {
+    const androidData = await fetchPlayerDataAndroidNative(trackId, env);
+    const progressive = pickProgressiveFormat(androidData?.streamingData);
+    if (progressive?.url) {
+      console.log(LOG_PREFIX, `AndroidNative progressive proxy for ${trackId}`);
+      return await proxyAdaptiveUrl(progressive, ANDROID_NATIVE_UA, 'https://www.youtube.com');
+    }
+    const best = pickBestAudio(androidData?.streamingData);
+    if (best) {
+      console.log(LOG_PREFIX, `AndroidNative adaptive proxy for ${trackId}`);
+      return await proxyAdaptiveUrl(best, ANDROID_NATIVE_UA, 'https://www.youtube.com');
+    }
+  } catch (androidErr) {
+    console.log(LOG_PREFIX, `AndroidNative failed for ${trackId}: ${androidErr.message}`);
+  }
+
+  // ── Step 4: iOS → hlsManifestUrl ─────────────────────────────────────────
   try {
     const iosData = await fetchPlayerData(trackId, env, userToken);
     const hlsUrl = iosData?.streamingData?.hlsManifestUrl;
@@ -880,7 +954,7 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
     console.log(LOG_PREFIX, `iOS failed for ${trackId}: ${iosErr.message}`);
   }
 
-  // ── Step 4: WEB_EMBEDDED_PLAYER → HLS or proxy ───────────────────────────
+  // ── Step 5: WEB_EMBEDDED_PLAYER → HLS or proxy ───────────────────────────
   try {
     const webData = await fetchPlayerDataWebEmbedded(trackId, env);
     const hlsUrl = webData?.streamingData?.hlsManifestUrl;
@@ -900,7 +974,7 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
     console.log(LOG_PREFIX, `WebEmbedded failed for ${trackId}: ${webErr.message}`);
   }
 
-  // ── Step 5: Android VR proxy — last resort ────────────────────────────────
+  // ── Step 6: Android VR proxy — last resort ────────────────────────────────
   try {
     const vrData = await fetchPlayerDataAndroidVR(trackId, env);
     const best = pickBestAudio(vrData?.streamingData);
@@ -915,7 +989,6 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
 
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
 }
-
 
 // /download/{id}
 // Uses the Android Music client whose CDN URLs are directly fetchable server-side.
@@ -1126,7 +1199,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'2.2.0', description:v.description,
+    id:v.id, name:v.name, version:'2.3.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
@@ -1246,7 +1319,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   </div>
   <div class="warn">Each URL is unique to your session. Regenerating creates a new URL — old ones keep working.</div>
 </div>
-<footer>YouTube Music for Eclipse &middot; v2.2.0 &middot; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse &middot; v2.3.0 &middot; Cloudflare Workers</footer>
 <script>
 let tok=null,urls={};
 function base(){return location.origin;}
