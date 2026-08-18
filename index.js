@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.0
+// author: ricky | version: 3.0.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY_FALLBACK = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -173,9 +173,21 @@ function parseDuration(text) {
 }
 function isDuration(text) { return /^\d{1,2}:\d{2}(:\d{2})?$/.test((text||'').trim()); }
 function isBullet(text)   { return /^\s*[•·]\s*$/.test(text||''); }
+
+function upscaleThumbnail(url) {
+  if (!url) return url;
+  if (url.includes('googleusercontent.com')) {
+    return url.replace(/=w\d+-h\d+(-[a-z0-9]+)*/i, '=w544-h544-l90-rj');
+  }
+  if (url.includes('ytimg.com')) {
+    return url.replace(/\/(default|mqdefault|hqdefault|sddefault|maxresdefault)\.jpg(\?.*)?$/, '/maxresdefault.jpg');
+  }
+  return url;
+}
 function bestThumbnail(thumbs) {
   if (!thumbs?.length) return '';
-  return thumbs.reduce((b,t)=>((t.width||0)>(b.width||0)?t:b)).url;
+  const best = thumbs.reduce((b,t)=>((t.width||0)>(b.width||0)?t:b));
+  return upscaleThumbnail(best.url);
 }
 function runsText(runs) { return (runs||[]).map(r=>r.text||'').join('').trim(); }
 
@@ -272,7 +284,7 @@ async function ytDataChannelSearch(query, env) {
       .map(id=>{
         const s=statsMap.get(id);
         const fb=items.find(i=>(i.snippet?.channelId||i.id?.channelId)===id);
-        return { id, name:s?.title||fb?.snippet?.title||'', artworkURL:s?.thumb||fb?.snippet?.thumbnails?.high?.url||'', subscribers:s?.subscribers||0 };
+        return { id, name:s?.title||fb?.snippet?.title||'', artworkURL:upscaleThumbnail(s?.thumb||fb?.snippet?.thumbnails?.high?.url||''), subscribers:s?.subscribers||0 };
       })
       .filter(a=>a.id&&a.name)
       .sort((a,b)=>b.subscribers-a.subscribers)
@@ -290,12 +302,12 @@ async function ytDataChannelVideos(channelId, artistName, env) {
     const videoIds=(data.items||[]).map(i=>i.id?.videoId).filter(Boolean);
     if (!videoIds.length) return [];
     const dr=await fetch(`https://www.googleapis.com/youtube/v3/videos?part=contentDetails,snippet&id=${videoIds.join(',')}&key=${apiKey}`);
-    if (!dr.ok) return videoIds.map((id,i)=>({ id, title:data.items[i]?.snippet?.title||'Unknown', artist:artistName, album:'', duration:0, artworkURL:data.items[i]?.snippet?.thumbnails?.high?.url||'', format:'aac' }));
+    if (!dr.ok) return videoIds.map((id,i)=>({ id, title:data.items[i]?.snippet?.title||'Unknown', artist:artistName, album:'', duration:0, artworkURL:upscaleThumbnail(data.items[i]?.snippet?.thumbnails?.high?.url||''), format:'aac' }));
     const dd=await dr.json();
     return (dd.items||[]).map(v=>({
       id:v.id, title:v.snippet?.title||'Unknown', artist:artistName, album:'',
       duration:parseDuration(v.contentDetails?.duration||''),
-      artworkURL:v.snippet?.thumbnails?.high?.url||v.snippet?.thumbnails?.default?.url||'',
+      artworkURL:upscaleThumbnail(v.snippet?.thumbnails?.high?.url||v.snippet?.thumbnails?.default?.url||''),
       format:'aac',
     })).filter(t=>t.id&&t.title);
   } catch(e){ console.log(LOG_PREFIX,'ytDataChannelVideos failed:',e.message); return []; }
@@ -561,7 +573,6 @@ async function handleSearch(query, env, userToken, mode) {
   if (plR.status==='fulfilled'&&plR.value) for (const s of getShelves(plR.value))
     for (const it of s.contents||[]){ const p=parsePlaylistItem(it); if(p&&playlists.length<12)playlists.push(p); }
 
-  // ── Per-category backfill (parallel, only for whichever came back empty) ─
   const needTracks    = fetchSongs && tracks.length===0;
   const needAlbums    = fetchAlbums && albums.length===0;
   const needArtists   = artists.length===0;
@@ -1089,7 +1100,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'2.9.0', description:v.description,
+    id:v.id, name:v.name, version:'3.0.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
@@ -1209,7 +1220,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   </div>
   <div class="warn">Each URL is unique to your session. Regenerating creates a new URL — old ones keep working.</div>
 </div>
-<footer>YouTube Music for Eclipse &middot; v2.9.0 &middot; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse &middot; v3.0.0 &middot; Cloudflare Workers</footer>
 <script>
 let tok=null,urls={};
 function base(){return location.origin;}
