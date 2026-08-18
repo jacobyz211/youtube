@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.1 (high-res artwork fix)
+// author: ricky | version: 2.9.1 (high-res artwork fix) + 8SPINE support
 
 const LOG_PREFIX = '[YTMusic]';
 const YTM_BASE = 'https://music.youtube.com';
@@ -121,7 +121,6 @@ function tryRefreshVisitor(data, env, userToken) {
   const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
   if (vd) upstashCmd(env, 'SET', key, vd, 'EX', VISITOR_TTL_SEC);
 }
-
 function parseDuration(text) {
   if (!text) return 0;
   const s = String(text).trim();
@@ -269,7 +268,6 @@ async function ytDataChannelSearch(query, env) {
     return [];
   }
 }
-
 async function ytDataChannelVideos(channelId, artistName, env) {
   const apiKey = env?.YOUTUBE_DATA_API_KEY;
   if (!apiKey) return [];
@@ -970,8 +968,159 @@ function buildManifest(mode) {
   };
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// ── 8SPINE MODULE SUPPORT (added — does not alter anything above) ──────
+//   /8spine.js            → module code (both mode)
+//   /8spine-songs.js     → module code (songs mode)
+//   /8spine-videos.js    → module code (videos mode)
+//   /8spine-source.json  → source listing for 8SPINE's "Add Source" screen
+// ═══════════════════════════════════════════════════════════════════════
+function buildSpineModuleSource(mode, origin) {
+  const variants = {
+    both:   { id: 'com.ricky.youtube-music-8spine',        name: 'YouTube Music (Songs & Videos)', qs: '' },
+    songs:  { id: 'com.ricky.youtube-music-8spine-songs',  name: 'YouTube Music (Songs)',          qs: '&mode=songs' },
+    videos: { id: 'com.ricky.youtube-music-8spine-videos', name: 'YouTube Music (Videos)',         qs: '&mode=videos' },
+  };
+  const v = variants[mode] || variants.both;
+  return `
+const YTM_8SPINE_BASE = '${origin}';
+const YTM_8SPINE_QS = '${v.qs}';
+
+const MODULE = {
+  id: '${v.id}',
+  name: '${v.name}',
+  version: '2.9.1',
+  labels: ['AAC', 'HLS', 'FREE'],
+
+  searchTracks: async (query, limit) => {
+    const res = await fetch(\`\${YTM_8SPINE_BASE}/search?q=\${encodeURIComponent(query)}\${YTM_8SPINE_QS}\`);
+    const data = await res.json();
+    const tracks = (data.tracks || []).slice(0, limit || 40).map(t => ({
+      id: t.id,
+      title: t.title,
+      artist: t.artist,
+      album: t.album,
+      duration: t.duration,
+      albumCover: t.artworkURL,
+    }));
+    return { tracks, total: tracks.length };
+  },
+
+  getTrackStreamUrl: async (trackId, quality) => {
+    const res = await fetch(\`\${YTM_8SPINE_BASE}/stream/\${trackId}\`);
+    const data = await res.json();
+    return {
+      streamUrl: data.url,
+      track: {
+        id: trackId,
+        audioQuality: data.format === 'hls' ? 'LOSSLESS' : 'HIGH',
+      },
+    };
+  },
+
+  getAlbum: async (id) => {
+    const res = await fetch(\`\${YTM_8SPINE_BASE}/album/\${id}\`);
+    const data = await res.json();
+    return {
+      album: {
+        id: data.id,
+        title: data.title,
+        artist: data.artist,
+        albumCover: data.artworkURL,
+      },
+      tracks: (data.tracks || []).map(t => ({
+        id: t.id,
+        title: t.title,
+        artist: t.artist,
+        album: t.album,
+        duration: t.duration,
+        albumCover: t.artworkURL,
+      })),
+    };
+  },
+
+  getArtist: async (id) => {
+    const res = await fetch(\`\${YTM_8SPINE_BASE}/artist/\${id}\${YTM_8SPINE_QS}\`);
+    const data = await res.json();
+    return {
+      artist: {
+        id: data.id,
+        name: data.name,
+        albumCover: data.artworkURL,
+      },
+      tracks: (data.topTracks || []).map(t => ({
+        id: t.id,
+        title: t.title,
+        artist: t.artist,
+        album: t.album,
+        duration: t.duration,
+        albumCover: t.artworkURL,
+      })),
+    };
+  },
+};
+
+return MODULE;
+`.trim();
+}
+
+function buildSpineSource(origin) {
+  return {
+    'category:music': [
+      {
+        id: 'ytmusic-8spine-both',
+        name: 'YouTube Music',
+        author: 'Ricky',
+        version: '2.9.1',
+        description: 'Full YouTube Music catalog — Songs & Videos, Albums, Artists, Playlists. HLS + AAC. No account required.',
+        labels: ['AAC', 'HLS', 'FREE'],
+        download: `${origin}/8spine.js`,
+      },
+      {
+        id: 'ytmusic-8spine-songs',
+        name: 'YouTube Music — Songs',
+        author: 'Ricky',
+        version: '2.9.1',
+        description: 'YouTube Music Songs tab only, plus Albums, Artists & Playlists. HLS + AAC. No account required.',
+        labels: ['AAC', 'HLS', 'FREE'],
+        download: `${origin}/8spine-songs.js`,
+      },
+      {
+        id: 'ytmusic-8spine-videos',
+        name: 'YouTube Music — Videos',
+        author: 'Ricky',
+        version: '2.9.1',
+        description: 'YouTube Music Videos tab, plus Artists & Playlists. HLS + AAC. No account required.',
+        labels: ['AAC', 'HLS', 'FREE'],
+        download: `${origin}/8spine-videos.js`,
+      },
+    ],
+  };
+}
+
 async function handleRoute(rest, url, request, env, userToken, mode) {
   const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
+  // ── 8SPINE source listing (added) ─────────────────────────────────────
+  if (rest === '/8spine-source.json') return jsonRes(buildSpineSource(url.origin));
+  // ── 8SPINE module code endpoints (added) ─────────────────────────────
+  if (rest === '/8spine.js') {
+    return new Response(buildSpineModuleSource('both', url.origin), {
+      status: 200,
+      headers: { 'content-type': 'application/javascript; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
+    });
+  }
+  if (rest === '/8spine-songs.js') {
+    return new Response(buildSpineModuleSource('songs', url.origin), {
+      status: 200,
+      headers: { 'content-type': 'application/javascript; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
+    });
+  }
+  if (rest === '/8spine-videos.js') {
+    return new Response(buildSpineModuleSource('videos', url.origin), {
+      status: 200,
+      headers: { 'content-type': 'application/javascript; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
+    });
+  }
   if (rest === '/manifest.json' || rest === '/manifest') return jsonRes(buildManifest(mode));
   if (rest === '/search') return jsonRes(await handleSearch(q, env, userToken, mode));
   if (rest.startsWith('/stream/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleStream(id, env, userToken)); }
