@@ -1,6 +1,10 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.1 (high-res artwork fix) + 8SPINE support
-// 8SPINE fix: removed async/await from module code (8SPINE's new Function() doesn't support async)
+// author: ricky | version: 2.9.2 (sequential streaming + search fixes + 8SPINE support)
+// Changes from 2.9.1:
+//   - handleStream: sequential instead of parallel (stops triggering YouTube bot detection)
+//   - fetchPlayerData: stop deleting visitor data on bot blocks (keeps cache valid)
+//   - handleSearch: backfill only for empty categories, keeps all 6 search types
+//   - 8SPINE module support (async-free module code)
 
 const LOG_PREFIX = '[YTMusic]';
 const YTM_BASE = 'https://music.youtube.com';
@@ -136,14 +140,8 @@ function isDuration(text) { return /^\d{1,2}:\d{2}(:\d{2})?$/.test((text || '').
 function isBullet(text) { return /^\s*[•·]\s*$/.test(text || ''); }
 
 // ── Artwork quality fix ──────────────────────────────────────────────────
-// YouTube Music's API only ever returns small thumbnail renditions (often
-// 120–226px). Google's photo CDN (googleusercontent.com / ggpht.com) lets
-// you request a much larger render of the *same* underlying image by
-// rewriting the trailing size suffix in the URL, so we upsize every piece
-// of artwork to 1200x1200 instead of using whatever tiny size YTM handed us.
 function upscaleArtwork(url) {
   if (!url || typeof url !== 'string') return url;
-
   if (/googleusercontent\.com|ggpht\.com/.test(url)) {
     const hasSizeSuffix = /=[\w-]*$/.test(url);
     if (!hasSizeSuffix) return `${url}=w1200-h1200-l100-rj`;
@@ -155,12 +153,8 @@ function upscaleArtwork(url) {
       return '=w1200-h1200';
     });
   }
-
-  // Raw YouTube video thumbnails (i.ytimg.com) — used only by the YouTube
-  // Data API fallback paths. Bump to the highest fixed-name rendition.
   const ytimgMatch = url.match(/^(https?:\/\/i\.ytimg\.com\/vi(?:_webp)?\/[\w-]{6,})\/(?:default|mqdefault|hqdefault|sddefault|maxresdefault)(\.\w+)(\?.*)?$/);
   if (ytimgMatch) return `${ytimgMatch[1]}/maxresdefault${ytimgMatch[2]}${ytimgMatch[3] || ''}`;
-
   return url;
 }
 
@@ -552,26 +546,40 @@ async function handleSearch(query, env, userToken, mode) {
   }
   if (plR.status === 'fulfilled' && plR.value) for (const s of getShelves(plR.value)) for (const it of s.contents || []) { const p = parsePlaylistItem(it); if (p && playlists.length < 12) playlists.push(p); }
 
-  // ── Per-category backfill (parallel, only for whichever came back empty) ──
+  // ── Sequential backfill: only for empty categories, one at a time ──
   const needTracks = fetchSongs && tracks.length === 0;
   const needAlbums = fetchAlbums && albums.length === 0;
   const needArtists = artists.length === 0;
   const needPlaylists = playlists.length === 0;
 
+  if (needTracks) {
+    try {
+      const tFB = await ytmSearchAndroid(query, SEARCH_PARAMS.songs, env);
+      for (const s of getShelves(tFB)) for (const it of s.contents || []) { addTrack(parseTrackRenderer(it.musicResponsiveListItemRenderer)); if (tracks.length >= 40) break; }
+    } catch (e) { console.log(LOG_PREFIX, 'tracks backfill failed:', e.message); }
+  }
+  if (needAlbums) {
+    try {
+      const aFB = await ytmSearchAndroid(query, SEARCH_PARAMS.albums, env);
+      for (const s of getShelves(aFB)) for (const it of s.contents || []) { const a = parseAlbumItem(it); if (a && albums.length < 15) albums.push(a); }
+    } catch (e) { console.log(LOG_PREFIX, 'albums backfill failed:', e.message); }
+  }
+  if (needArtists) {
+    try {
+      const arFB = await ytmSearchAndroid(query, SEARCH_PARAMS.artists, env);
+      for (const s of getShelves(arFB)) for (const it of s.contents || []) {
+        const a = parseArtistItem(it);
+        if (a && !seenArtistIds.has(a.id) && artists.length < 12) { seenArtistIds.add(a.id); artists.push(a); }
+      }
+    } catch (e) { console.log(LOG_PREFIX, 'artists backfill failed:', e.message); }
+  }
+  if (needPlaylists) {
+    try {
+      const pFB = await ytmSearchAndroid(query, SEARCH_PARAMS.playlists, env);
+      for (const s of getShelves(pFB)) for (const it of s.contents || []) { const p = parsePlaylistItem(it); if (p && playlists.length < 12) playlists.push(p); }
+    } catch (e) { console.log(LOG_PREFIX, 'playlists backfill failed:', e.message); }
+  }
   if (needTracks || needAlbums || needArtists || needPlaylists) {
-    const [tFB, aFB, arFB, pFB] = await Promise.allSettled([
-      needTracks ? ytmSearchAndroid(query, SEARCH_PARAMS.songs, env) : Promise.resolve(null),
-      needAlbums ? ytmSearchAndroid(query, SEARCH_PARAMS.albums, env) : Promise.resolve(null),
-      needArtists ? ytmSearchAndroid(query, SEARCH_PARAMS.artists, env) : Promise.resolve(null),
-      needPlaylists ? ytmSearchAndroid(query, SEARCH_PARAMS.playlists, env) : Promise.resolve(null),
-    ]);
-    if (needTracks && tFB.status === 'fulfilled' && tFB.value) for (const s of getShelves(tFB.value)) for (const it of s.contents || []) { addTrack(parseTrackRenderer(it.musicResponsiveListItemRenderer)); if (tracks.length >= 40) break; }
-    if (needAlbums && aFB.status === 'fulfilled' && aFB.value) for (const s of getShelves(aFB.value)) for (const it of s.contents || []) { const a = parseAlbumItem(it); if (a && albums.length < 15) albums.push(a); }
-    if (needArtists && arFB.status === 'fulfilled' && arFB.value) for (const s of getShelves(arFB.value)) for (const it of s.contents || []) {
-      const a = parseArtistItem(it);
-      if (a && !seenArtistIds.has(a.id) && artists.length < 12) { seenArtistIds.add(a.id); artists.push(a); }
-    }
-    if (needPlaylists && pFB.status === 'fulfilled' && pFB.value) for (const s of getShelves(pFB.value)) for (const it of s.contents || []) { const p = parsePlaylistItem(it); if (p && playlists.length < 12) playlists.push(p); }
     console.log(LOG_PREFIX, `category backfill for "${query}": tracks=${needTracks} albums=${needAlbums} artists=${needArtists} playlists=${needPlaylists}`);
   }
 
@@ -596,12 +604,8 @@ async function fetchPlayerData(trackId, env, userToken) {
   if (data?.playabilityStatus?.status !== 'OK') {
     const reason = data?.playabilityStatus?.reason || '';
     const status = data?.playabilityStatus?.status || '';
-    const hardBlock = ['BOT_CHALLENGE', 'LOGIN_REQUIRED', 'UNPLAYABLE'].includes(status) ||
-      reason.toLowerCase().includes('bot') || reason.toLowerCase().includes('sign in');
-    if (visitorData && hardBlock) {
-      const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
-      upstashCmd(env, 'DEL', key);
-    }
+    // FIX: do NOT delete visitor data on bot blocks — the cache is still valid,
+    // deleting it just forces a slow fresh fetch on the next request
     throw new Error(`${LOG_PREFIX} iOS blocked: ${reason || status || 'unknown'}`);
   }
   return data;
@@ -756,6 +760,11 @@ async function resolveAndroidVR(trackId, env) {
   throw new Error('no usable format');
 }
 
+// ── FIX: Sequential stream resolution instead of parallel ──────────────
+// Previously: Promise.allSettled fired all 6 resolvers at once, YouTube saw
+// 6 simultaneous player API calls from the same IP and blocked them all as
+// "Sign in to confirm you're not a bot". Now: try one at a time, return on
+// first success. Best case = 1 API call, worst case = 6 (but sequential).
 async function handleStream(trackId, env, userToken) {
   const resolvers = [
     { name: 'AndroidNative', run: () => resolveAndroidNative(trackId, env) },
@@ -765,11 +774,16 @@ async function handleStream(trackId, env, userToken) {
     { name: 'WebEmbedded', run: () => resolveWebEmbedded(trackId, env) },
     { name: 'AndroidVR', run: () => resolveAndroidVR(trackId, env) },
   ];
-  const settled = await Promise.allSettled(resolvers.map(r => r.run()));
-  for (let i = 0; i < resolvers.length; i++) {
-    const s = settled[i];
-    if (s.status === 'fulfilled') { console.log(LOG_PREFIX, `${resolvers[i].name} resolved for ${trackId}`); return s.value; }
-    console.log(LOG_PREFIX, `${resolvers[i].name} failed for ${trackId}: ${s.reason?.message}`);
+  for (const resolver of resolvers) {
+    try {
+      const result = await resolver.run();
+      if (result) {
+        console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}`);
+        return result;
+      }
+    } catch (e) {
+      console.log(LOG_PREFIX, `${resolver.name} failed for ${trackId}: ${e.message}`);
+    }
   }
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
 }
@@ -961,7 +975,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.1', description: v.description,
+    id: v.id, name: v.name, version: '2.9.2', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog'],
     types: ['track', 'album', 'artist', 'playlist'],
@@ -970,12 +984,11 @@ function buildManifest(mode) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// ── 8SPINE MODULE SUPPORT (added — does not alter anything above) ──────
+// ── 8SPINE MODULE SUPPORT ──────────────────────────────────────────────
 //   /8spine.js            → module code (both mode)
 //   /8spine-songs.js     → module code (songs mode)
 //   /8spine-videos.js    → module code (videos mode)
 //   /8spine-source.json  → source listing for 8SPINE's "Add Source" screen
-// FIX: No async/await in module code — 8SPINE's new Function() doesn't support it
 // ═══════════════════════════════════════════════════════════════════════
 function buildSpineModuleSource(mode, origin) {
   const variants = {
@@ -991,7 +1004,7 @@ function buildSpineModuleSource(mode, origin) {
     "var MODULE = {",
     "  id: '" + v.id + "',",
     "  name: '" + v.name + "',",
-    "  version: '2.9.1',",
+    "  version: '2.9.2',",
     "  labels: ['AAC', 'HLS', 'FREE'],",
     "",
     "  searchTracks: function(query, limit) {",
@@ -1054,7 +1067,7 @@ function buildSpineSource(origin) {
         id: 'ytmusic-8spine-both',
         name: 'YouTube Music',
         author: 'Ricky',
-        version: '2.9.1',
+        version: '2.9.2',
         description: 'Full YouTube Music catalog — Songs & Videos, Albums, Artists, Playlists. HLS + AAC. No account required.',
         labels: ['AAC', 'HLS', 'FREE'],
         download: `${origin}/8spine.js`,
@@ -1063,7 +1076,7 @@ function buildSpineSource(origin) {
         id: 'ytmusic-8spine-songs',
         name: 'YouTube Music — Songs',
         author: 'Ricky',
-        version: '2.9.1',
+        version: '2.9.2',
         description: 'YouTube Music Songs tab only, plus Albums, Artists & Playlists. HLS + AAC. No account required.',
         labels: ['AAC', 'HLS', 'FREE'],
         download: `${origin}/8spine-songs.js`,
@@ -1072,7 +1085,7 @@ function buildSpineSource(origin) {
         id: 'ytmusic-8spine-videos',
         name: 'YouTube Music — Videos',
         author: 'Ricky',
-        version: '2.9.1',
+        version: '2.9.2',
         description: 'YouTube Music Videos tab, plus Artists & Playlists. HLS + AAC. No account required.',
         labels: ['AAC', 'HLS', 'FREE'],
         download: `${origin}/8spine-videos.js`,
@@ -1083,9 +1096,9 @@ function buildSpineSource(origin) {
 
 async function handleRoute(rest, url, request, env, userToken, mode) {
   const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
-  // ── 8SPINE source listing (added) ─────────────────────────────────────
+  // ── 8SPINE source listing ─────────────────────────────────────────────
   if (rest === '/8spine-source.json') return jsonRes(buildSpineSource(url.origin));
-  // ── 8SPINE module code endpoints (added) ─────────────────────────────
+  // ── 8SPINE module code endpoints ─────────────────────────────────────
   if (rest === '/8spine.js') {
     return new Response(buildSpineModuleSource('both', url.origin), {
       status: 200,
@@ -1220,7 +1233,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
 </div>
 <div class="warn">Each URL is unique to your session. Regenerating creates a new URL; old ones keep working.</div>
 </div>
-<footer>YouTube Music for Eclipse &middot; v2.9.1 &middot; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse &middot; v2.9.2 &middot; Cloudflare Workers</footer>
 <script>
 let tok=null,urls={};
 function base(){return location.origin}
