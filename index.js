@@ -1,5 +1,6 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
 // author: ricky | version: 2.9.1 (high-res artwork fix) + 8SPINE support
+// 8SPINE fix: removed async/await from module code (8SPINE's new Function() doesn't support async)
 
 const LOG_PREFIX = '[YTMusic]';
 const YTM_BASE = 'https://music.youtube.com';
@@ -974,6 +975,7 @@ function buildManifest(mode) {
 //   /8spine-songs.js     → module code (songs mode)
 //   /8spine-videos.js    → module code (videos mode)
 //   /8spine-source.json  → source listing for 8SPINE's "Add Source" screen
+// FIX: No async/await in module code — 8SPINE's new Function() doesn't support it
 // ═══════════════════════════════════════════════════════════════════════
 function buildSpineModuleSource(mode, origin) {
   const variants = {
@@ -982,86 +984,67 @@ function buildSpineModuleSource(mode, origin) {
     videos: { id: 'com.ricky.youtube-music-8spine-videos', name: 'YouTube Music (Videos)',         qs: '&mode=videos' },
   };
   const v = variants[mode] || variants.both;
-  return `
-const YTM_8SPINE_BASE = '${origin}';
-const YTM_8SPINE_QS = '${v.qs}';
-
-const MODULE = {
-  id: '${v.id}',
-  name: '${v.name}',
-  version: '2.9.1',
-  labels: ['AAC', 'HLS', 'FREE'],
-
-  searchTracks: async (query, limit) => {
-    const res = await fetch(\`\${YTM_8SPINE_BASE}/search?q=\${encodeURIComponent(query)}\${YTM_8SPINE_QS}\`);
-    const data = await res.json();
-    const tracks = (data.tracks || []).slice(0, limit || 40).map(t => ({
-      id: t.id,
-      title: t.title,
-      artist: t.artist,
-      album: t.album,
-      duration: t.duration,
-      albumCover: t.artworkURL,
-    }));
-    return { tracks, total: tracks.length };
-  },
-
-  getTrackStreamUrl: async (trackId, quality) => {
-    const res = await fetch(\`\${YTM_8SPINE_BASE}/stream/\${trackId}\`);
-    const data = await res.json();
-    return {
-      streamUrl: data.url,
-      track: {
-        id: trackId,
-        audioQuality: data.format === 'hls' ? 'LOSSLESS' : 'HIGH',
-      },
-    };
-  },
-
-  getAlbum: async (id) => {
-    const res = await fetch(\`\${YTM_8SPINE_BASE}/album/\${id}\`);
-    const data = await res.json();
-    return {
-      album: {
-        id: data.id,
-        title: data.title,
-        artist: data.artist,
-        albumCover: data.artworkURL,
-      },
-      tracks: (data.tracks || []).map(t => ({
-        id: t.id,
-        title: t.title,
-        artist: t.artist,
-        album: t.album,
-        duration: t.duration,
-        albumCover: t.artworkURL,
-      })),
-    };
-  },
-
-  getArtist: async (id) => {
-    const res = await fetch(\`\${YTM_8SPINE_BASE}/artist/\${id}\${YTM_8SPINE_QS}\`);
-    const data = await res.json();
-    return {
-      artist: {
-        id: data.id,
-        name: data.name,
-        albumCover: data.artworkURL,
-      },
-      tracks: (data.topTracks || []).map(t => ({
-        id: t.id,
-        title: t.title,
-        artist: t.artist,
-        album: t.album,
-        duration: t.duration,
-        albumCover: t.artworkURL,
-      })),
-    };
-  },
-};
-
-return MODULE;
-`.trim();
+  return [
+    "var YTM_8SPINE_BASE = '" + origin + "';",
+    "var YTM_8SPINE_QS = '" + v.qs + "';",
+    "",
+    "var MODULE = {",
+    "  id: '" + v.id + "',",
+    "  name: '" + v.name + "',",
+    "  version: '2.9.1',",
+    "  labels: ['AAC', 'HLS', 'FREE'],",
+    "",
+    "  searchTracks: function(query, limit) {",
+    "    return fetch(YTM_8SPINE_BASE + '/search?q=' + encodeURIComponent(query) + YTM_8SPINE_QS)",
+    "      .then(function(res) { return res.json(); })",
+    "      .then(function(data) {",
+    "        var tracks = (data.tracks || []).slice(0, limit || 40).map(function(t) {",
+    "          return { id: t.id, title: t.title, artist: t.artist, album: t.album, duration: t.duration, albumCover: t.artworkURL };",
+    "        });",
+    "        return { tracks: tracks, total: tracks.length };",
+    "      });",
+    "  },",
+    "",
+    "  getTrackStreamUrl: function(trackId, quality) {",
+    "    return fetch(YTM_8SPINE_BASE + '/stream/' + trackId)",
+    "      .then(function(res) { return res.json(); })",
+    "      .then(function(data) {",
+    "        return {",
+    "          streamUrl: data.url,",
+    "          track: { id: trackId, audioQuality: data.format === 'hls' ? 'LOSSLESS' : 'HIGH' }",
+    "        };",
+    "      });",
+    "  },",
+    "",
+    "  getAlbum: function(id) {",
+    "    return fetch(YTM_8SPINE_BASE + '/album/' + id)",
+    "      .then(function(res) { return res.json(); })",
+    "      .then(function(data) {",
+    "        return {",
+    "          album: { id: data.id, title: data.title, artist: data.artist, albumCover: data.artworkURL },",
+    "          tracks: (data.tracks || []).map(function(t) {",
+    "            return { id: t.id, title: t.title, artist: t.artist, album: t.album, duration: t.duration, albumCover: t.artworkURL };",
+    "          })",
+    "        };",
+    "      });",
+    "  },",
+    "",
+    "  getArtist: function(id) {",
+    "    return fetch(YTM_8SPINE_BASE + '/artist/' + id + YTM_8SPINE_QS)",
+    "      .then(function(res) { return res.json(); })",
+    "      .then(function(data) {",
+    "        return {",
+    "          artist: { id: data.id, name: data.name, albumCover: data.artworkURL },",
+    "          tracks: (data.topTracks || []).map(function(t) {",
+    "            return { id: t.id, title: t.title, artist: t.artist, album: t.album, duration: t.duration, albumCover: t.artworkURL };",
+    "          })",
+    "        };",
+    "      });",
+    "  }",
+    "};",
+    "",
+    "return MODULE;"
+  ].join("\n");
 }
 
 function buildSpineSource(origin) {
