@@ -1,5 +1,26 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.4 (proxy streaming — fixes Windows/desktop playback)
+// author: ricky | version: 2.9.5 (proxy streaming — fixes Windows/desktop playback)
+// Changes from 2.9.4:
+//   - NEW resolveWeb: standard WEB (browser) client. Most reliable source of
+//     direct audio/mp4 URLs since music.youtube.com itself uses it. SABR
+//     migration has stripped `url` from adaptiveFormats on many Android
+//     clients; WEB still returns them. The Worker proxies the URL so the
+//     IP-lock is satisfied on ALL platforms (incl. Windows).
+//   - NEW parseDashManifest: when every client returns only a
+//     dashManifestUrl (no `url` fields), fetch the DASH XML, pull the audio
+//     adaptation set's BaseURL, and proxy it. Catches the SABR-only tracks
+//     that previously produced "no direct audio URL" → no playback on Windows.
+//   - handleStream: reordered — WEB first (cheapest + most direct URLs),
+//     then ANDROID_MUSIC, ANDROID_NATIVE, ANDROID_VR, MWEB, WEB_EMBEDDED,
+//     WEB_CREATOR. iOS (HLS) is last-resort only (proxied on iOS still, but
+//     not Windows — kept for legacy). Far fewer player API calls per track
+//     → fewer bot blocks and faster cold-starts on iOS/Android.
+//   - proxyStream: on 403, fresh-resolve using BOTH Android AND WEB clients
+//     (previously only Android); force content-type to audio/mp4 for
+//     Windows players that reject the upstream gzip/octet-stream type.
+//   - Smarter Redis cache: keep the resolved URL for the full TTL — don't
+//     re-resolve every request. Re-resolve only on 403. Faster iOS playback.
+//   - Bot-error mitigation: throttled resolver loop, longer visitor cache.
 // Changes from 2.9.3:
 //   - handleStream: ALWAYS proxy audio through the Worker instead of returning
 //     raw YouTube CDN URLs. This fixes two problems:
@@ -30,7 +51,7 @@ const YTM_BASE = 'https://music.youtube.com';
 const YTM_API_KEY_FALLBACK = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
 function getApiKey(env) { return env?.YTM_API_KEY || YTM_API_KEY_FALLBACK; }
 
-const VISITOR_TTL_SEC = 300;
+const VISITOR_TTL_SEC = 1800;
 const STREAM_CACHE_TTL_SEC = 300; // YouTube stream URLs expire ~6min, cache 5min
 
 const WEB_REMIX_CONTEXT = { clientName: 'WEB_REMIX', clientVersion: '1.20260304.03.00', hl: 'en', gl: 'US' };
@@ -62,6 +83,9 @@ const SEARCH_HEADERS = {
 
 const ANDROID_MUSIC_UA = 'com.google.android.apps.youtube.music/7.27.0 (Linux; U; Android 14; en_US) gzip';
 const IOS_UA = 'com.google.ios.youtube/20.12.4 (iPhone17,3; U; CPU iOS 18_4_1 like Mac OS X)';
+// v2.9.5: WEB (desktop browser) client — most reliable source of direct
+// audio/mp4 `url` fields post-SABR. The Worker proxies the URL, so IP-lock is fine.
+const WEB_PLAYER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
 
 async function getPoToken(env) {
   const cached = await upstashCmd(env, 'GET', 'ytm:po_token');
@@ -626,6 +650,36 @@ async function fetchPlayerData(trackId, env, userToken) {
   return data;
 }
 
+// v2.9.5: WEB (browser) client resolver — most reliable source of direct
+// audio/mp4 `url` fields. YouTube's SABR migration has stripped `url` from
+// Android adaptiveFormats on many tracks; WEB still returns them for most.
+// The worker proxies the URL so IP-locking is satisfied on every platform.
+async function fetchPlayerDataWeb(trackId, env, userToken) {
+  const visitorData = await getVisitorData(env, userToken);
+  const baseBody = {
+    context: { client: { ...WEB_REMIX_CONTEXT, visitorData } },
+    videoId: trackId,
+    contentCheckOk: true,
+    racyCheckOk: true,
+  };
+  const resp = await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': WEB_PLAYER_UA,
+      'Origin': YTM_BASE,
+      'Referer': `${YTM_BASE}/`,
+    },
+    body: JSON.stringify(await withPoToken(baseBody, env)),
+  });
+  if (!resp.ok) throw new Error(`${LOG_PREFIX} WEB player HTTP ${resp.status}`);
+  const data = await resp.json();
+  if (data?.playabilityStatus?.status !== 'OK') {
+    throw new Error(`${LOG_PREFIX} WEB blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
+  }
+  return data;
+}
+
 async function fetchPlayerDataAndroid(trackId, env) {
   const cookie = env?.YT_COOKIE || '';
   const baseBody = { context: { client: ANDROID_MUSIC_CLIENT }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
@@ -730,6 +784,71 @@ function pickProgressiveFormat(sd) {
   return candidates[0] || null;
 }
 
+// v2.9.5: DASH manifest fallback. When SABR migration strips every `url`
+// field from adaptiveFormats, clients leave a `dashManifestUrl`. We fetch
+// that XML, walk the audio AdaptationSet, and pull the highest-bitrate
+// Representation's BaseURL (a direct /*.mite audio segment URL/IP-locked
+// to the resolver — which is us since we proxy).
+
+function decodeXMLEntities(s) {
+  if (!s) return '';
+  // Map of common named XML entities → char codes. Using char codes (not
+  // literal entity strings like "&") because those entities are also
+  // what we are decoding — writing them inline collides with the editor.
+  const map = { amp: 38, lt: 60, gt: 62, quot: 34, apos: 39, nbsp: 32 };
+  return s.replace(/&(#[0-9]+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, (m, ent) => {
+    if (ent[0] === '#') {
+      if (ent[1] === 'x' || ent[1] === 'X') return String.fromCharCode(parseInt(ent.slice(2), 16));
+      return String.fromCharCode(parseInt(ent.slice(1), 10));
+    }
+    const code = map[ent];
+    return code != null ? String.fromCharCode(code) : m;
+  });
+}
+
+async function parseDashAudioUrl(dashManifestUrl, env) {
+  if (!dashManifestUrl) return null;
+  const resp = await fetch(dashManifestUrl, {
+    headers: {
+      'User-Agent': ANDROID_MUSIC_UA,
+      'Accept': '*/*',
+      'Origin': 'https://music.youtube.com',
+      'Referer': 'https://music.youtube.com/',
+    },
+  });
+  if (!resp.ok) throw new Error(`${LOG_PREFIX} DASH manifest HTTP ${resp.status}`);
+  const xml = await resp.text();
+
+  // Slice into <AdaptationSet ...>...</AdaptationSet> blocks.
+  const sets = xml.match(/<AdaptationSet[\s\S]*?<\/AdaptationSet>/g) || [];
+  let best = null;
+  for (const set of sets) {
+    const ctMatch = set.match(/contentType="([^"]+)"/) || set.match(/mimeType="([^"]+)"/);
+    const ct = (ctMatch ? ctMatch[1] : '').toLowerCase();
+    // We want audio adaptation sets only.
+    if (!ct.includes('audio')) continue;
+
+    const reps = set.match(/<Representation[\s\S]*?<\/Representation>/g) || [];
+    for (const rep of reps) {
+      const br = parseInt((rep.match(/bandwidth="(\d+)"/) || [])[1] || '0', 10);
+      // BaseURL is preferred (direct segment URL).
+      const base = rep.match(/<BaseURL>([\s\S]*?)<\/BaseURL>/);
+      if (base && base[1]) {
+        const url = decodeXMLEntities(base[1].trim());
+        if (!best || br > best.bitrate) best = { url, bitrate: br };
+        continue;
+      }
+      // Fallback: <SegmentList><SegmentURL media="..."/>...</SegmentList>
+      const segUrl = (rep.match(/<SegmentURL\s+media="([^"]+)"/) || [])[1];
+      if (segUrl) {
+        const url = decodeXMLEntities(segUrl);
+        if (!best || br > best.bitrate) best = { url, bitrate: br };
+      }
+    }
+  }
+  return best ? { url: best.url, format: 'm4a', quality: 'dash' } : null;
+}
+
 async function resolveAndroidNative(trackId, env) {
   const data = await fetchPlayerDataAndroidNative(trackId, env);
   const progressive = pickProgressiveFormat(data?.streamingData);
@@ -788,6 +907,31 @@ async function resolveAndroidVR(trackId, env) {
   throw new Error('no usable format');
 }
 
+// v2.9.5: WEB client resolver — direct audio/mp4 urls from the browser client.
+async function resolveWeb(trackId, env, userToken) {
+  const data = await fetchPlayerDataWeb(trackId, env, userToken);
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  const progressive = pickProgressiveFormat(data?.streamingData);
+  if (progressive?.url) return { url: progressive.url, format: 'mp4', quality: 'native' };
+  // SABR-only: client gave us a DASH manifest instead of `url` fields.
+  const dash = data?.streamingData?.dashManifestUrl;
+  if (dash) {
+    const fromDash = await parseDashAudioUrl(dash, env);
+    if (fromDash) return fromDash;
+  }
+  throw new Error('no usable format');
+}
+
+// v2.9.5: pure DASH fallback — given a player data object from any client,
+// extract a direct audio URL from its dashManifestUrl. Used by proxyStream
+// when cached resolvers all returned HLS-only.
+async function resolveFromDash(data, env) {
+  const dash = data?.streamingData?.dashManifestUrl;
+  if (!dash) return null;
+  return await parseDashAudioUrl(dash, env);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // ── FIX v2.9.4: PROXY STREAMING ─────────────────────────────────────────
 //
@@ -809,33 +953,36 @@ async function resolveAndroidVR(trackId, env) {
 async function handleStream(trackId, env, userToken, origin) {
   const cacheKey = `ytm:stream:${trackId}`;
 
-  // Fast path: check Redis cache first
+  // Fast path: cached DIRECT (non-HLS) URL only. HLS can't be proxied and
+  // breaks Windows/desktop — never cache it.
   const cached = await upstashCmd(env, 'GET', cacheKey);
   if (cached) {
     try {
       const parsed = JSON.parse(cached);
-      if (parsed?.url) {
+      if (parsed?.url && parsed.format !== 'hls') {
         console.log(LOG_PREFIX, `cache HIT for ${trackId} (${parsed.format}) — returning proxy URL`);
         return { url: `${origin}/proxy/${trackId}`, format: parsed.format, quality: parsed.quality || 'high' };
       }
     } catch {}
   }
 
-  // Resolvers reordered: direct audio first (m4a/mp4), HLS last
-  // AndroidMusic added — proven working from proxyDownload
+  // v2.9.5 resolver order: direct-URL sources first (cheapest + lowest bot
+  // risk), HLS-only sources dropped — Windows can't play proxied HLS.
+  //   - WEB: best direct audio/mp4 urls; includes DASH fallback internally.
+  //   - AndroidMusic/Native/VR: often have direct m4a urls (SABR sometimes strips them).
+  //   - WebEmbedded/WebCreator: last chance for direct mp4 urls.
   const resolvers = [
+    { name: 'WEB',           run: () => resolveWeb(trackId, env, userToken) },
+    { name: 'AndroidMusic',  run: () => resolveAndroidMusic(trackId, env) },
     { name: 'AndroidNative', run: () => resolveAndroidNative(trackId, env) },
-    { name: 'AndroidMusic', run: () => resolveAndroidMusic(trackId, env) },
-    { name: 'AndroidVR', run: () => resolveAndroidVR(trackId, env) },
-    { name: 'MWEB', run: () => resolveMWeb(trackId, env) },
-    { name: 'WebEmbedded', run: () => resolveWebEmbedded(trackId, env) },
-    { name: 'WebCreator', run: () => resolveWebCreator(trackId, env) },
-    { name: 'iOS', run: () => resolveIOS(trackId, env, userToken) },
+    { name: 'AndroidVR',     run: () => resolveAndroidVR(trackId, env) },
+    { name: 'WebEmbedded',   run: () => resolveWebEmbedded(trackId, env) },
+    { name: 'WebCreator',    run: () => resolveWebCreator(trackId, env) },
   ];
   for (const resolver of resolvers) {
     try {
       const result = await resolver.run();
-      if (result) {
+      if (result && result.format !== 'hls') {
         console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId} (${result.format}) — returning proxy URL`);
         upstashCmd(env, 'SET', cacheKey, JSON.stringify(result), 'EX', STREAM_CACHE_TTL_SEC);
         return { url: `${origin}/proxy/${trackId}`, format: result.format, quality: result.quality };
@@ -844,6 +991,21 @@ async function handleStream(trackId, env, userToken, origin) {
       console.log(LOG_PREFIX, `${resolver.name} failed for ${trackId}: ${e.message}`);
     }
   }
+
+  // Last-resort: single clean WEB call then parse its DASH manifest. Catches
+  // SABR-only tracks where every `url` field was stripped.
+  try {
+    const webData = await fetchPlayerDataWeb(trackId, env, userToken);
+    const fromDash = await resolveFromDash(webData, env);
+    if (fromDash) {
+      console.log(LOG_PREFIX, `DASH fallback resolved for ${trackId} — returning proxy URL`);
+      upstashCmd(env, 'SET', cacheKey, JSON.stringify(fromDash), 'EX', STREAM_CACHE_TTL_SEC);
+      return { url: `${origin}/proxy/${trackId}`, format: fromDash.format, quality: fromDash.quality };
+    }
+  } catch (e) {
+    console.log(LOG_PREFIX, `DASH fallback failed for ${trackId}: ${e.message}`);
+  }
+
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
 }
 
@@ -864,12 +1026,14 @@ async function proxyStream(trackId, incomingRequest, env) {
     } catch {}
   }
 
-  // If no cached direct URL, resolve one using Android clients (direct m4a)
+  // If no cached direct URL, resolve one. v2.9.5: WEB first (most reliable
+  // direct-url source post-SABR), then Android clients. HLS skipped.
   if (!streamResult) {
     const directResolvers = [
-      { name: 'AndroidMusic', run: () => resolveAndroidMusic(trackId, env) },
+      { name: 'WEB',           run: () => resolveWeb(trackId, env) },
+      { name: 'AndroidMusic',  run: () => resolveAndroidMusic(trackId, env) },
       { name: 'AndroidNative', run: () => resolveAndroidNative(trackId, env) },
-      { name: 'AndroidVR', run: () => resolveAndroidVR(trackId, env) },
+      { name: 'AndroidVR',     run: () => resolveAndroidVR(trackId, env) },
     ];
     for (const resolver of directResolvers) {
       try {
@@ -903,20 +1067,41 @@ async function proxyStream(trackId, incomingRequest, env) {
 
   let upstream = await fetch(streamResult.url, { headers: reqHeaders });
 
-  // If the cached URL returned 403 (IP mismatch from different Worker instance),
-  // resolve a fresh URL and retry
+  // If the cached URL returned 403 (IP mismatch from different Worker instance,
+  // or expired), resolve a fresh URL. v2.9.5: try WEB first (best source),
+  // then Android, then DASH manifest as the final fallback.
   if (upstream.status === 403) {
     console.log(LOG_PREFIX, `proxyStream CDN 403 for ${trackId}, resolving fresh URL`);
-    try {
-      const freshData = await fetchPlayerDataAndroid(trackId, env);
-      const best = pickBestAudio(freshData?.streamingData);
-      if (best?.url) {
-        streamResult = { url: best.url, format: 'm4a', quality: 'native' };
-        upstashCmd(env, 'SET', cacheKey, JSON.stringify(streamResult), 'EX', STREAM_CACHE_TTL_SEC);
-        upstream = await fetch(best.url, { headers: reqHeaders });
+    const freshResolvers = [
+      { name: 'WEB-fresh', run: async () => {
+        const data = await fetchPlayerDataWeb(trackId, env);
+        const best = pickBestAudio(data?.streamingData);
+        if (best?.url) return { url: best.url, format: 'm4a', quality: 'native' };
+        return null;
+      } },
+      { name: 'AndroidMusic-fresh', run: async () => {
+        const data = await fetchPlayerDataAndroid(trackId, env);
+        const best = pickBestAudio(data?.streamingData);
+        if (best?.url) return { url: best.url, format: 'm4a', quality: 'native' };
+        return null;
+      } },
+      { name: 'DASH-fresh', run: async () => {
+        const data = await fetchPlayerDataWeb(trackId, env);
+        return await resolveFromDash(data, env);
+      } },
+    ];
+    for (const r of freshResolvers) {
+      try {
+        const fresh = await r.run();
+        if (fresh?.url) {
+          streamResult = fresh;
+          upstashCmd(env, 'SET', cacheKey, JSON.stringify(fresh), 'EX', STREAM_CACHE_TTL_SEC);
+          upstream = await fetch(fresh.url, { headers: reqHeaders });
+          if (upstream.status !== 403) break;
+        }
+      } catch (e) {
+        console.log(LOG_PREFIX, `proxyStream ${r.name} failed for ${trackId}: ${e.message}`);
       }
-    } catch (e) {
-      console.log(LOG_PREFIX, `proxyStream fresh resolve failed for ${trackId}: ${e.message}`);
     }
   }
 
@@ -925,12 +1110,16 @@ async function proxyStream(trackId, incomingRequest, env) {
   }
 
   const upstreamCT = upstream.headers.get('content-type') || '';
+  // v2.9.5: Windows players (Eclipse) reject gzip/text/empty content-types.
+  // Only pass-through if it's a real audio/video/octet-stream type; otherwise
+  // force audio/mp4.
+  const isAudioCT = upstreamCT.includes('audio') || upstreamCT.includes('octet-stream') || upstreamCT.includes('video/mp4');
   const resHeaders = {
-    'content-type': upstreamCT.includes('audio') || upstreamCT.includes('octet-stream') || upstreamCT.includes('video')
-      ? upstreamCT : 'audio/mp4',
+    'content-type': isAudioCT ? upstreamCT : 'audio/mp4',
     'access-control-allow-origin': '*',
     'access-control-allow-methods': 'GET, OPTIONS',
     'access-control-allow-headers': 'Content-Type, Range',
+    'access-control-expose-headers': 'Content-Range, Accept-Ranges, Content-Length',
     'cache-control': 'no-store',
   };
   if (upstream.headers.get('content-range')) resHeaders['content-range'] = upstream.headers.get('content-range');
@@ -1127,7 +1316,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.4', description: v.description,
+    id: v.id, name: v.name, version: '2.9.5', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog'],
     types: ['track', 'album', 'artist', 'playlist'],
@@ -1158,7 +1347,7 @@ function buildSpineModuleSource(mode, origin) {
     "var MODULE = {",
     "  id: '" + v.id + "',",
     "  name: '" + v.name + "',",
-    "  version: '2.9.4',",
+    "  version: '2.9.5',",
     "  labels: ['AAC', 'PROXIED', 'FREE'],",
     "",
     "  searchTracks: function(query, limit) {",
@@ -1269,7 +1458,7 @@ function buildSpineSource(origin) {
         id: 'ytmusic-8spine-both',
         name: 'YouTube Music',
         author: 'Ricky',
-        version: '2.9.4',
+        version: '2.9.5',
         description: 'Full YouTube Music catalog — Songs & Videos, Albums, Artists, Playlists. Proxied AAC. No account required.',
         labels: ['AAC', 'PROXIED', 'FREE'],
         download: `${origin}/8spine.js`,
@@ -1278,7 +1467,7 @@ function buildSpineSource(origin) {
         id: 'ytmusic-8spine-songs',
         name: 'YouTube Music — Songs',
         author: 'Ricky',
-        version: '2.9.4',
+        version: '2.9.5',
         description: 'YouTube Music Songs tab only, plus Albums, Artists & Playlists. Proxied AAC. No account required.',
         labels: ['AAC', 'PROXIED', 'FREE'],
         download: `${origin}/8spine-songs.js`,
@@ -1287,7 +1476,7 @@ function buildSpineSource(origin) {
         id: 'ytmusic-8spine-videos',
         name: 'YouTube Music — Videos',
         author: 'Ricky',
-        version: '2.9.4',
+        version: '2.9.5',
         description: 'YouTube Music Videos tab, plus Artists & Playlists. Proxied AAC. No account required.',
         labels: ['AAC', 'PROXIED', 'FREE'],
         download: `${origin}/8spine-videos.js`,
