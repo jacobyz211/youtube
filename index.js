@@ -1198,7 +1198,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
 <rect x="32" y="11" width="4" height="30" rx="2" fill="white"/>
 <rect x="39" y="17" width="4" height="18" rx="2" fill="white"/>
 </svg>
-<h1>YouTube Music for Eclipse</h1>
+<h1>YouTube Music</h1>
 <p class="sub">Full YouTube Music catalog &mdash; Songs, Videos, Albums, Artists &amp; Playlists. No account required.</p>
 <div class="tip"><b>Save your URLs.</b> Paste one below any time to copy it again without reinstalling.</div>
 <div class="pills">
