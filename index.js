@@ -1147,7 +1147,7 @@ function buildPage() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>YouTube Music</title>
+<title>YouTube Music for Eclipse</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#080808;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:48px 20px 64px}
