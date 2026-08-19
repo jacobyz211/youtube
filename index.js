@@ -1,10 +1,10 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.3 (stream caching + parallel resolver + timeout)
-// Changes from 2.9.2:
-//   - handleStream: cache resolved URLs in Upstash (5min TTL) for instant replays
-//   - handleStream: try top 2 resolvers in parallel (AndroidNative + iOS) with 5s timeout
-//   - handleStream: sequential fallback for remaining resolvers with 5s timeout each
-//   - withTimeout helper: prevents hanging resolvers from blocking the chain
+// author: ricky | version: 2.9.2 (sequential streaming + search fixes + 8SPINE support)
+// Changes from 2.9.1:
+//   - handleStream: sequential instead of parallel (stops triggering YouTube bot detection)
+//   - fetchPlayerData: stop deleting visitor data on bot blocks (keeps cache valid)
+//   - handleSearch: backfill only for empty categories, keeps all 6 search types
+//   - 8SPINE module support (async-free module code)
 
 const LOG_PREFIX = '[YTMusic]';
 const YTM_BASE = 'https://music.youtube.com';
@@ -142,7 +142,6 @@ function isBullet(text) { return /^\s*[•·]\s*$/.test(text || ''); }
 // ── Artwork quality fix ──────────────────────────────────────────────────
 function upscaleArtwork(url) {
   if (!url || typeof url !== 'string') return url;
-
   if (/googleusercontent\.com|ggpht\.com/.test(url)) {
     const hasSizeSuffix = /=[\w-]*$/.test(url);
     if (!hasSizeSuffix) return `${url}=w1200-h1200-l100-rj`;
@@ -154,10 +153,8 @@ function upscaleArtwork(url) {
       return '=w1200-h1200';
     });
   }
-
   const ytimgMatch = url.match(/^(https?:\/\/i\.ytimg\.com\/vi(?:_webp)?\/[\w-]{6,})\/(?:default|mqdefault|hqdefault|sddefault|maxresdefault)(\.\w+)(\?.*)?$/);
   if (ytimgMatch) return `${ytimgMatch[1]}/maxresdefault${ytimgMatch[2]}${ytimgMatch[3] || ''}`;
-
   return url;
 }
 
@@ -555,13 +552,41 @@ async function handleSearch(query, env, userToken, mode) {
   const needArtists = artists.length === 0;
   const needPlaylists = playlists.length === 0;
 
-  if (needTracks) { try { const tFB = await ytmSearchAndroid(query, SEARCH_PARAMS.songs, env); for (const s of getShelves(tFB)) for (const it of s.contents || []) { addTrack(parseTrackRenderer(it.musicResponsiveListItemRenderer)); if (tracks.length >= 40) break; } } catch (e) { console.log(LOG_PREFIX, 'tracks backfill failed:', e.message); } }
-  if (needAlbums) { try { const aFB = await ytmSearchAndroid(query, SEARCH_PARAMS.albums, env); for (const s of getShelves(aFB)) for (const it of s.contents || []) { const a = parseAlbumItem(it); if (a && albums.length < 15) albums.push(a); } } catch (e) { console.log(LOG_PREFIX, 'albums backfill failed:', e.message); } }
-  if (needArtists) { try { const arFB = await ytmSearchAndroid(query, SEARCH_PARAMS.artists, env); for (const s of getShelves(arFB)) for (const it of s.contents || []) { const a = parseArtistItem(it); if (a && !seenArtistIds.has(a.id) && artists.length < 12) { seenArtistIds.add(a.id); artists.push(a); } } } catch (e) { console.log(LOG_PREFIX, 'artists backfill failed:', e.message); } }
-  if (needPlaylists) { try { const pFB = await ytmSearchAndroid(query, SEARCH_PARAMS.playlists, env); for (const s of getShelves(pFB)) for (const it of s.contents || []) { const p = parsePlaylistItem(it); if (p && playlists.length < 12) playlists.push(p); } } catch (e) { console.log(LOG_PREFIX, 'playlists backfill failed:', e.message); } }
-  if (needTracks || needAlbums || needArtists || needPlaylists) { console.log(LOG_PREFIX, `category backfill for "${query}": tracks=${needTracks} albums=${needAlbums} artists=${needArtists} playlists=${needPlaylists}`); }
+  if (needTracks) {
+    try {
+      const tFB = await ytmSearchAndroid(query, SEARCH_PARAMS.songs, env);
+      for (const s of getShelves(tFB)) for (const it of s.contents || []) { addTrack(parseTrackRenderer(it.musicResponsiveListItemRenderer)); if (tracks.length >= 40) break; }
+    } catch (e) { console.log(LOG_PREFIX, 'tracks backfill failed:', e.message); }
+  }
+  if (needAlbums) {
+    try {
+      const aFB = await ytmSearchAndroid(query, SEARCH_PARAMS.albums, env);
+      for (const s of getShelves(aFB)) for (const it of s.contents || []) { const a = parseAlbumItem(it); if (a && albums.length < 15) albums.push(a); }
+    } catch (e) { console.log(LOG_PREFIX, 'albums backfill failed:', e.message); }
+  }
+  if (needArtists) {
+    try {
+      const arFB = await ytmSearchAndroid(query, SEARCH_PARAMS.artists, env);
+      for (const s of getShelves(arFB)) for (const it of s.contents || []) {
+        const a = parseArtistItem(it);
+        if (a && !seenArtistIds.has(a.id) && artists.length < 12) { seenArtistIds.add(a.id); artists.push(a); }
+      }
+    } catch (e) { console.log(LOG_PREFIX, 'artists backfill failed:', e.message); }
+  }
+  if (needPlaylists) {
+    try {
+      const pFB = await ytmSearchAndroid(query, SEARCH_PARAMS.playlists, env);
+      for (const s of getShelves(pFB)) for (const it of s.contents || []) { const p = parsePlaylistItem(it); if (p && playlists.length < 12) playlists.push(p); }
+    } catch (e) { console.log(LOG_PREFIX, 'playlists backfill failed:', e.message); }
+  }
+  if (needTracks || needAlbums || needArtists || needPlaylists) {
+    console.log(LOG_PREFIX, `category backfill for "${query}": tracks=${needTracks} albums=${needAlbums} artists=${needArtists} playlists=${needPlaylists}`);
+  }
 
-  if (artists.length === 0) { const ytChannels = await ytDataChannelSearch(query, env); for (const ch of ytChannels) if (!seenArtistIds.has(ch.id) && artists.length < 12) { seenArtistIds.add(ch.id); artists.push(ch); } }
+  if (artists.length === 0) {
+    const ytChannels = await ytDataChannelSearch(query, env);
+    for (const ch of ytChannels) if (!seenArtistIds.has(ch.id) && artists.length < 12) { seenArtistIds.add(ch.id); artists.push(ch); }
+  }
 
   return { tracks, albums, artists, playlists };
 }
@@ -579,6 +604,8 @@ async function fetchPlayerData(trackId, env, userToken) {
   if (data?.playabilityStatus?.status !== 'OK') {
     const reason = data?.playabilityStatus?.reason || '';
     const status = data?.playabilityStatus?.status || '';
+    // FIX: do NOT delete visitor data on bot blocks — the cache is still valid,
+    // deleting it just forces a slow fresh fetch on the next request
     throw new Error(`${LOG_PREFIX} iOS blocked: ${reason || status || 'unknown'}`);
   }
   return data;
@@ -733,29 +760,12 @@ async function resolveAndroidVR(trackId, env) {
   throw new Error('no usable format');
 }
 
-// ── withTimeout: prevents a hanging resolver from blocking the chain ─────
-function withTimeout(promise, ms) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout after ' + ms + 'ms')), ms))
-  ]);
-}
-
-// ── handleStream: cache + parallel first 2 + sequential fallback + timeout
+// ── FIX: Sequential stream resolution instead of parallel ──────────────
+// Previously: Promise.allSettled fired all 6 resolvers at once, YouTube saw
+// 6 simultaneous player API calls from the same IP and blocked them all as
+// "Sign in to confirm you're not a bot". Now: try one at a time, return on
+// first success. Best case = 1 API call, worst case = 6 (but sequential).
 async function handleStream(trackId, env, userToken) {
-  // 1. Check Upstash cache first — instant for recently played tracks
-  const cacheKey = 'ytm:stream:' + trackId;
-  const cached = await upstashCmd(env, 'GET', cacheKey);
-  if (cached) {
-    try {
-      const parsed = JSON.parse(cached);
-      if (parsed && parsed.url) {
-        console.log(LOG_PREFIX, 'stream cache hit for ' + trackId);
-        return parsed;
-      }
-    } catch (e) {}
-  }
-
   const resolvers = [
     { name: 'AndroidNative', run: () => resolveAndroidNative(trackId, env) },
     { name: 'iOS', run: () => resolveIOS(trackId, env, userToken) },
@@ -764,34 +774,17 @@ async function handleStream(trackId, env, userToken) {
     { name: 'WebEmbedded', run: () => resolveWebEmbedded(trackId, env) },
     { name: 'AndroidVR', run: () => resolveAndroidVR(trackId, env) },
   ];
-
-  // 2. Try top 2 resolvers in parallel with 5s timeout — fast for common case
-  try {
-    const result = await Promise.race([
-      withTimeout(resolvers[0].run(), 5000).then(r => ({ name: resolvers[0].name, result: r })),
-      withTimeout(resolvers[1].run(), 5000).then(r => ({ name: resolvers[1].name, result: r })),
-    ]);
-    console.log(LOG_PREFIX, result.name + ' resolved for ' + trackId);
-    upstashCmd(env, 'SET', cacheKey, JSON.stringify(result.result), 'EX', 300);
-    return result.result;
-  } catch (e) {
-    console.log(LOG_PREFIX, 'parallel pair failed for ' + trackId + ': ' + e.message);
-  }
-
-  // 3. Fall back to sequential for remaining resolvers with 5s timeout each
-  for (let i = 2; i < resolvers.length; i++) {
+  for (const resolver of resolvers) {
     try {
-      const result = await withTimeout(resolvers[i].run(), 5000);
+      const result = await resolver.run();
       if (result) {
-        console.log(LOG_PREFIX, resolvers[i].name + ' resolved for ' + trackId);
-        upstashCmd(env, 'SET', cacheKey, JSON.stringify(result), 'EX', 300);
+        console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}`);
         return result;
       }
     } catch (e) {
-      console.log(LOG_PREFIX, resolvers[i].name + ' failed for ' + trackId + ': ' + e.message);
+      console.log(LOG_PREFIX, `${resolver.name} failed for ${trackId}: ${e.message}`);
     }
   }
-
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
 }
 
@@ -887,15 +880,61 @@ async function handleArtist(artistId, env, userToken, mode) {
 
   if (mode === 'videos') {
     let topTracks = [];
-    try { const channelData = await browseChannelVideos(artistId, env, userToken); topTracks = extractChannelVideoTracks(channelData, name); } catch (e) { console.log(LOG_PREFIX, 'channel browse failed:', e.message); }
-    if (topTracks.length === 0 && env?.YOUTUBE_DATA_API_KEY) { try { topTracks = await ytDataChannelVideos(artistId, name, env); } catch (e) { console.log(LOG_PREFIX, 'ytData videos fallback failed:', e.message); } }
-    if (topTracks.length === 0) { try { const vr = await ytmSearch(name, SEARCH_PARAMS.videos, env, userToken); const seenIds = new Set(), nameLower = name.toLowerCase(); for (const shelf of getShelves(vr)) for (const it of shelf.contents || []) { const t = parseTrackRenderer(it.musicResponsiveListItemRenderer, name, '', ''); if (t && !seenIds.has(t.id)) { if (!t.artist || t.artist.toLowerCase().includes(nameLower) || nameLower.includes(t.artist.toLowerCase())) { seenIds.add(t.id); topTracks.push(t); } } if (topTracks.length >= 20) break; } } catch (e) { console.log(LOG_PREFIX, 'video search fallback failed:', e.message); } }
+    try {
+      const channelData = await browseChannelVideos(artistId, env, userToken);
+      topTracks = extractChannelVideoTracks(channelData, name);
+    } catch (e) { console.log(LOG_PREFIX, 'channel browse failed:', e.message); }
+    if (topTracks.length === 0 && env?.YOUTUBE_DATA_API_KEY) {
+      try { topTracks = await ytDataChannelVideos(artistId, name, env); } catch (e) { console.log(LOG_PREFIX, 'ytData videos fallback failed:', e.message); }
+    }
+    if (topTracks.length === 0) {
+      try {
+        const vr = await ytmSearch(name, SEARCH_PARAMS.videos, env, userToken);
+        const seenIds = new Set(), nameLower = name.toLowerCase();
+        for (const shelf of getShelves(vr)) for (const it of shelf.contents || []) {
+          const t = parseTrackRenderer(it.musicResponsiveListItemRenderer, name, '', '');
+          if (t && !seenIds.has(t.id)) {
+            if (!t.artist || t.artist.toLowerCase().includes(nameLower) || nameLower.includes(t.artist.toLowerCase())) { seenIds.add(t.id); topTracks.push(t); }
+          }
+          if (topTracks.length >= 20) break;
+        }
+      } catch (e) { console.log(LOG_PREFIX, 'video search fallback failed:', e.message); }
+    }
     return { id: artistId, name, artworkURL, bio: null, topTracks, albums };
   }
 
   let topTracks = rawTracks;
-  if (topTracks.length === 0) { try { const sr = await ytmSearch(name, SEARCH_PARAMS.songs, env, userToken); const seenIds = new Set(), nameLower = name.toLowerCase(); for (const shelf of getShelves(sr)) for (const it of shelf.contents || []) { const t = parseTrackRenderer(it.musicResponsiveListItemRenderer, name, '', ''); if (t && !seenIds.has(t.id)) { if (!t.artist || t.artist.toLowerCase().includes(nameLower) || nameLower.includes(t.artist.toLowerCase())) { seenIds.add(t.id); topTracks.push(t); } } if (topTracks.length >= 15) break; } console.log(LOG_PREFIX, `artist top-tracks fallback recovered ${topTracks.length} for "${name}"`); } catch (e) { console.log(LOG_PREFIX, 'artist top-tracks fallback failed:', e.message); } }
-  if (topTracks.some(t => t.duration === 0)) { try { const sr = await ytmSearch(name, SEARCH_PARAMS.songs, env, userToken); const dMap = new Map(); for (const shelf of getShelves(sr)) for (const it of shelf.contents || []) { const r = it.musicResponsiveListItemRenderer; if (!r) continue; const vid = getVideoId(r); if (!vid) continue; const info = parseInfoRuns(r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || []); const fixRaw = r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || ''; const dur = (isDuration(fixRaw) ? fixRaw : '') || info.duration; if (vid && dur) dMap.set(vid, parseDuration(dur)); } for (const t of topTracks) if (t.duration === 0 && dMap.has(t.id)) t.duration = dMap.get(t.id); } catch (e) { console.log(LOG_PREFIX, 'duration enrich failed:', e.message); } }
+  if (topTracks.length === 0) {
+    try {
+      const sr = await ytmSearch(name, SEARCH_PARAMS.songs, env, userToken);
+      const seenIds = new Set(), nameLower = name.toLowerCase();
+      for (const shelf of getShelves(sr)) for (const it of shelf.contents || []) {
+        const t = parseTrackRenderer(it.musicResponsiveListItemRenderer, name, '', '');
+        if (t && !seenIds.has(t.id)) {
+          if (!t.artist || t.artist.toLowerCase().includes(nameLower) || nameLower.includes(t.artist.toLowerCase())) { seenIds.add(t.id); topTracks.push(t); }
+        }
+        if (topTracks.length >= 15) break;
+      }
+      console.log(LOG_PREFIX, `artist top-tracks fallback recovered ${topTracks.length} for "${name}"`);
+    } catch (e) { console.log(LOG_PREFIX, 'artist top-tracks fallback failed:', e.message); }
+  }
+  if (topTracks.some(t => t.duration === 0)) {
+    try {
+      const sr = await ytmSearch(name, SEARCH_PARAMS.songs, env, userToken);
+      const dMap = new Map();
+      for (const shelf of getShelves(sr)) for (const it of shelf.contents || []) {
+        const r = it.musicResponsiveListItemRenderer;
+        if (!r) continue;
+        const vid = getVideoId(r);
+        if (!vid) continue;
+        const info = parseInfoRuns(r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || []);
+        const fixRaw = r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || '';
+        const dur = (isDuration(fixRaw) ? fixRaw : '') || info.duration;
+        if (vid && dur) dMap.set(vid, parseDuration(dur));
+      }
+      for (const t of topTracks) if (t.duration === 0 && dMap.has(t.id)) t.duration = dMap.get(t.id);
+    } catch (e) { console.log(LOG_PREFIX, 'duration enrich failed:', e.message); }
+  }
   topTracks = topTracks.filter(t => t.duration > 0);
   return { id: artistId, name, artworkURL, bio: null, topTracks, albums };
 }
@@ -913,9 +952,18 @@ async function handlePlaylist(playlistId, env, userToken) {
   return { id: playlistId, title, creator, artworkURL, trackCount: tracks.length, tracks };
 }
 
-function generateToken() { const arr = new Uint8Array(14); crypto.getRandomValues(arr); return Array.from(arr, b => b.toString(16).padStart(2, '0')).join(''); }
+function generateToken() {
+  const arr = new Uint8Array(14);
+  crypto.getRandomValues(arr);
+  return Array.from(arr, b => b.toString(16).padStart(2, '0')).join('');
+}
 function isValidToken(t) { return typeof t === 'string' && /^[a-f0-9]{28}$/.test(t); }
-function parseTokenPath(p) { const m = p.match(/^\/u\/([a-f0-9]{28})\/(songs|videos)(\/.*)?$/); if (m) return { token: m[1], mode: m[2], rest: m[3] || '/' }; const m2 = p.match(/^\/u\/([a-f0-9]{28})(\/.*)?$/); return m2 ? { token: m2[1], mode: 'both', rest: m2[2] || '/' } : null; }
+function parseTokenPath(p) {
+  const m = p.match(/^\/u\/([a-f0-9]{28})\/(songs|videos)(\/.*)?$/);
+  if (m) return { token: m[1], mode: m[2], rest: m[3] || '/' };
+  const m2 = p.match(/^\/u\/([a-f0-9]{28})(\/.*)?$/);
+  return m2 ? { token: m2[1], mode: 'both', rest: m2[2] || '/' } : null;
+}
 function lastSegment(rest) { return rest.split('/').filter(Boolean).pop() || ''; }
 
 function buildManifest(mode) {
@@ -926,14 +974,27 @@ function buildManifest(mode) {
     videos: { id: 'com.ricky.youtube-music-videos', name: 'YouTube Music — Videos', description: 'Stream from YouTube Music — Videos tab. Artists & Playlists. HLS + AAC.' },
   };
   const v = variants[m] || variants.both;
-  return { id: v.id, name: v.name, version: '2.9.3', description: v.description, icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png', resources: ['search', 'stream', 'download', 'catalog'], types: ['track', 'album', 'artist', 'playlist'], contentType: 'music' };
+  return {
+    id: v.id, name: v.name, version: '2.9.2', description: v.description,
+    icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
+    resources: ['search', 'stream', 'download', 'catalog'],
+    types: ['track', 'album', 'artist', 'playlist'],
+    contentType: 'music',
+  };
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// ── 8SPINE MODULE SUPPORT ──────────────────────────────────────────────
+//   /8spine.js            → module code (both mode)
+//   /8spine-songs.js     → module code (songs mode)
+//   /8spine-videos.js    → module code (videos mode)
+//   /8spine-source.json  → source listing for 8SPINE's "Add Source" screen
+// ═══════════════════════════════════════════════════════════════════════
 function buildSpineModuleSource(mode, origin) {
   const variants = {
-    both: { id: 'com.ricky.youtube-music-8spine', name: 'YouTube Music (Songs & Videos)', qs: '' },
-    songs: { id: 'com.ricky.youtube-music-8spine-songs', name: 'YouTube Music (Songs)', qs: '&mode=songs' },
-    videos: { id: 'com.ricky.youtube-music-8spine-videos', name: 'YouTube Music (Videos)', qs: '&mode=videos' },
+    both:   { id: 'com.ricky.youtube-music-8spine',        name: 'YouTube Music (Songs & Videos)', qs: '' },
+    songs:  { id: 'com.ricky.youtube-music-8spine-songs',  name: 'YouTube Music (Songs)',          qs: '&mode=songs' },
+    videos: { id: 'com.ricky.youtube-music-8spine-videos', name: 'YouTube Music (Videos)',         qs: '&mode=videos' },
   };
   const v = variants[mode] || variants.both;
   return [
@@ -943,7 +1004,7 @@ function buildSpineModuleSource(mode, origin) {
     "var MODULE = {",
     "  id: '" + v.id + "',",
     "  name: '" + v.name + "',",
-    "  version: '2.9.3',",
+    "  version: '2.9.2',",
     "  labels: ['AAC', 'HLS', 'FREE'],",
     "",
     "  searchTracks: function(query, limit) {",
@@ -961,7 +1022,10 @@ function buildSpineModuleSource(mode, origin) {
     "    return fetch(YTM_8SPINE_BASE + '/stream/' + trackId)",
     "      .then(function(res) { return res.json(); })",
     "      .then(function(data) {",
-    "        return { streamUrl: data.url, track: { id: trackId, audioQuality: data.format === 'hls' ? 'LOSSLESS' : 'HIGH' } };",
+    "        return {",
+    "          streamUrl: data.url,",
+    "          track: { id: trackId, audioQuality: data.format === 'hls' ? 'LOSSLESS' : 'HIGH' }",
+    "        };",
     "      });",
     "  },",
     "",
@@ -969,7 +1033,12 @@ function buildSpineModuleSource(mode, origin) {
     "    return fetch(YTM_8SPINE_BASE + '/album/' + id)",
     "      .then(function(res) { return res.json(); })",
     "      .then(function(data) {",
-    "        return { album: { id: data.id, title: data.title, artist: data.artist, albumCover: data.artworkURL }, tracks: (data.tracks || []).map(function(t) { return { id: t.id, title: t.title, artist: t.artist, album: t.album, duration: t.duration, albumCover: t.artworkURL }; }) };",
+    "        return {",
+    "          album: { id: data.id, title: data.title, artist: data.artist, albumCover: data.artworkURL },",
+    "          tracks: (data.tracks || []).map(function(t) {",
+    "            return { id: t.id, title: t.title, artist: t.artist, album: t.album, duration: t.duration, albumCover: t.artworkURL };",
+    "          })",
+    "        };",
     "      });",
     "  },",
     "",
@@ -977,7 +1046,12 @@ function buildSpineModuleSource(mode, origin) {
     "    return fetch(YTM_8SPINE_BASE + '/artist/' + id + YTM_8SPINE_QS)",
     "      .then(function(res) { return res.json(); })",
     "      .then(function(data) {",
-    "        return { artist: { id: data.id, name: data.name, albumCover: data.artworkURL }, tracks: (data.topTracks || []).map(function(t) { return { id: t.id, title: t.title, artist: t.artist, album: t.album, duration: t.duration, albumCover: t.artworkURL }; }) };",
+    "        return {",
+    "          artist: { id: data.id, name: data.name, albumCover: data.artworkURL },",
+    "          tracks: (data.topTracks || []).map(function(t) {",
+    "            return { id: t.id, title: t.title, artist: t.artist, album: t.album, duration: t.duration, albumCover: t.artworkURL };",
+    "          })",
+    "        };",
     "      });",
     "  }",
     "};",
@@ -989,19 +1063,60 @@ function buildSpineModuleSource(mode, origin) {
 function buildSpineSource(origin) {
   return {
     'category:music': [
-      { id: 'ytmusic-8spine-both', name: 'YouTube Music', author: 'Ricky', version: '2.9.3', description: 'Full YouTube Music catalog — Songs & Videos, Albums, Artists, Playlists. HLS + AAC. No account required.', labels: ['AAC', 'HLS', 'FREE'], download: `${origin}/8spine.js` },
-      { id: 'ytmusic-8spine-songs', name: 'YouTube Music — Songs', author: 'Ricky', version: '2.9.3', description: 'YouTube Music Songs tab only, plus Albums, Artists & Playlists. HLS + AAC. No account required.', labels: ['AAC', 'HLS', 'FREE'], download: `${origin}/8spine-songs.js` },
-      { id: 'ytmusic-8spine-videos', name: 'YouTube Music — Videos', author: 'Ricky', version: '2.9.3', description: 'YouTube Music Videos tab, plus Artists & Playlists. HLS + AAC. No account required.', labels: ['AAC', 'HLS', 'FREE'], download: `${origin}/8spine-videos.js` },
+      {
+        id: 'ytmusic-8spine-both',
+        name: 'YouTube Music',
+        author: 'Ricky',
+        version: '2.9.2',
+        description: 'Full YouTube Music catalog — Songs & Videos, Albums, Artists, Playlists. HLS + AAC. No account required.',
+        labels: ['AAC', 'HLS', 'FREE'],
+        download: `${origin}/8spine.js`,
+      },
+      {
+        id: 'ytmusic-8spine-songs',
+        name: 'YouTube Music — Songs',
+        author: 'Ricky',
+        version: '2.9.2',
+        description: 'YouTube Music Songs tab only, plus Albums, Artists & Playlists. HLS + AAC. No account required.',
+        labels: ['AAC', 'HLS', 'FREE'],
+        download: `${origin}/8spine-songs.js`,
+      },
+      {
+        id: 'ytmusic-8spine-videos',
+        name: 'YouTube Music — Videos',
+        author: 'Ricky',
+        version: '2.9.2',
+        description: 'YouTube Music Videos tab, plus Artists & Playlists. HLS + AAC. No account required.',
+        labels: ['AAC', 'HLS', 'FREE'],
+        download: `${origin}/8spine-videos.js`,
+      },
     ],
   };
 }
 
 async function handleRoute(rest, url, request, env, userToken, mode) {
   const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
+  // ── 8SPINE source listing ─────────────────────────────────────────────
   if (rest === '/8spine-source.json') return jsonRes(buildSpineSource(url.origin));
-  if (rest === '/8spine.js') { return new Response(buildSpineModuleSource('both', url.origin), { status: 200, headers: { 'content-type': 'application/javascript; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' } }); }
-  if (rest === '/8spine-songs.js') { return new Response(buildSpineModuleSource('songs', url.origin), { status: 200, headers: { 'content-type': 'application/javascript; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' } }); }
-  if (rest === '/8spine-videos.js') { return new Response(buildSpineModuleSource('videos', url.origin), { status: 200, headers: { 'content-type': 'application/javascript; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' } }); }
+  // ── 8SPINE module code endpoints ─────────────────────────────────────
+  if (rest === '/8spine.js') {
+    return new Response(buildSpineModuleSource('both', url.origin), {
+      status: 200,
+      headers: { 'content-type': 'application/javascript; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
+    });
+  }
+  if (rest === '/8spine-songs.js') {
+    return new Response(buildSpineModuleSource('songs', url.origin), {
+      status: 200,
+      headers: { 'content-type': 'application/javascript; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
+    });
+  }
+  if (rest === '/8spine-videos.js') {
+    return new Response(buildSpineModuleSource('videos', url.origin), {
+      status: 200,
+      headers: { 'content-type': 'application/javascript; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
+    });
+  }
   if (rest === '/manifest.json' || rest === '/manifest') return jsonRes(buildManifest(mode));
   if (rest === '/search') return jsonRes(await handleSearch(q, env, userToken, mode));
   if (rest.startsWith('/stream/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleStream(id, env, userToken)); }
@@ -1012,7 +1127,18 @@ async function handleRoute(rest, url, request, env, userToken, mode) {
   return null;
 }
 
-function jsonRes(data, status) { return new Response(JSON.stringify(data, null, 2), { status: status || 200, headers: { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, POST, OPTIONS', 'access-control-allow-headers': 'Content-Type, Range', 'cache-control': 'no-store' } }); }
+function jsonRes(data, status) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status: status || 200,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'access-control-allow-origin': '*',
+      'access-control-allow-methods': 'GET, POST, OPTIONS',
+      'access-control-allow-headers': 'Content-Type, Range',
+      'cache-control': 'no-store',
+    },
+  });
+}
 function htmlRes(b) { return new Response(b, { headers: { 'content-type': 'text/html; charset=utf-8' } }); }
 
 function buildPage() {
@@ -1107,7 +1233,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
 </div>
 <div class="warn">Each URL is unique to your session. Regenerating creates a new URL; old ones keep working.</div>
 </div>
-<footer>YouTube Music for Eclipse &middot; v2.9.3 &middot; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse &middot; v2.9.2 &middot; Cloudflare Workers</footer>
 <script>
 let tok=null,urls={};
 function base(){return location.origin}
@@ -1132,14 +1258,24 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
+
     if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, POST, OPTIONS', 'access-control-allow-headers': 'Content-Type, Range' } });
+      return new Response(null, {
+        headers: {
+          'access-control-allow-origin': '*',
+          'access-control-allow-methods': 'GET, POST, OPTIONS',
+          'access-control-allow-headers': 'Content-Type, Range',
+        },
+      });
     }
+
     if (env?.YT_PO_TOKEN_GENERATOR_URL && env?.UPSTASH_REDIS_REST_URL) {
       const cached = await upstashCmd(env, 'GET', 'ytm:po_token');
       if (!cached) tryRefreshPoToken(env);
     }
+
     if (path === '/') return htmlRes(buildPage());
+
     const parsed = parseTokenPath(path);
     if (parsed) {
       if (!isValidToken(parsed.token)) return jsonRes({ error: 'Invalid token' }, 400);
@@ -1152,6 +1288,7 @@ export default {
       }
       return jsonRes({ error: 'Not found' }, 404);
     }
+
     try {
       const result = await handleRoute(path, url, request, env, null, 'both');
       if (result) return result;
