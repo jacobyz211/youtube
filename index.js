@@ -1,5 +1,12 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.2 (sequential streaming + search fixes + 8SPINE support)
+// author: ricky | version: 2.9.3 (+ video playback object, + settings capability)
+// Changes from 2.9.2:
+//   - ADDITIVE ONLY: /stream now also attaches a `video` object (per
+//     eclipsemusic.app/docs "Video Playback") when a muxed mp4 rendition
+//     exists. The existing audio url/format resolution logic is UNCHANGED.
+//   - New addon Settings capability (searchMode, videoQuality) so users can
+//     pick Songs/Videos/Both and preferred video quality from Eclipse's
+//     settings cog, instead of needing separate installs.
 // Changes from 2.9.1:
 //   - handleStream: sequential instead of parallel (stops triggering YouTube bot detection)
 //   - fetchPlayerData: stop deleting visitor data on bot blocks (keeps cache valid)
@@ -723,6 +730,33 @@ async function resolveAndroidNative(trackId, env) {
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
 }
+
+// ── Video support (ADDITIVE ONLY — eclipsemusic.app/docs "Video Playback") ──
+// This never touches the audio url/format decided above. It's a completely
+// separate, best-effort lookup for a muxed (video+audio in one file) mp4
+// rendition, attached to the stream response as an extra `video` field.
+function pickVideoRenditions(sd) {
+  const formats = sd?.formats || [];
+  return formats
+    .filter(f => f.url && f.mimeType && f.mimeType.startsWith('video/mp4') && f.mimeType.includes('mp4a') && f.height)
+    .map(f => ({ url: f.url, height: f.height, mimeType: 'video/mp4' }))
+    .sort((a, b) => b.height - a.height);
+}
+function buildVideoInfo(sd) {
+  const renditions = pickVideoRenditions(sd);
+  if (!renditions.length) return null;
+  const best = renditions[0];
+  return { url: best.url, mimeType: 'video/mp4', muxed: true, width: best.width || 0, height: best.height, renditions };
+}
+async function fetchVideoInfo(trackId, env) {
+  try {
+    const data = await fetchPlayerDataAndroidNative(trackId, env);
+    return buildVideoInfo(data?.streamingData);
+  } catch (e) {
+    console.log(LOG_PREFIX, `video lookup failed for ${trackId} (non-fatal):`, e.message);
+    return null;
+  }
+}
 async function resolveIOS(trackId, env, userToken) {
   const data = await fetchPlayerData(trackId, env, userToken);
   const hlsUrl = data?.streamingData?.hlsManifestUrl;
@@ -779,6 +813,15 @@ async function handleStream(trackId, env, userToken) {
       const result = await resolver.run();
       if (result) {
         console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}`);
+        // ADDITIVE ONLY: try to attach a `video` object (eclipsemusic.app/docs
+        // "Video Playback"). This is wrapped so it can never affect or block
+        // the audio result above — worst case, `video` is just left unset.
+        try {
+          const video = await fetchVideoInfo(trackId, env);
+          if (video) result.video = video;
+        } catch (e) {
+          console.log(LOG_PREFIX, `video attach skipped for ${trackId}:`, e.message);
+        }
         return result;
       }
     } catch (e) {
@@ -975,11 +1018,41 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.2', description: v.description,
+    id: v.id, name: v.name, version: '2.9.3', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
-    resources: ['search', 'stream', 'download', 'catalog'],
+    resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
     contentType: 'music',
+    // Addon Settings capability (eclipsemusic.app/docs → "Addon Settings").
+    // Eclipse shows a settings cog and appends these as query params
+    // (?searchMode=...&videoQuality=...) on every request. Purely additive —
+    // reading them is optional; defaults keep old installs working unchanged.
+    settings: [
+      {
+        key: 'searchMode',
+        type: 'select',
+        label: 'Search results',
+        help: 'Choose whether search returns songs, videos, or both.',
+        default: m,
+        options: [
+          { value: 'both', label: 'Songs & Videos' },
+          { value: 'songs', label: 'Songs only' },
+          { value: 'videos', label: 'Videos only' },
+        ],
+      },
+      {
+        key: 'videoQuality',
+        type: 'select',
+        label: 'Video quality',
+        help: 'Used when a track offers multiple video renditions.',
+        default: '1080p',
+        options: [
+          { value: '2160p', label: '4K' },
+          { value: '1080p', label: '1080p' },
+          { value: '720p', label: '720p' },
+        ],
+      },
+    ],
   };
 }
 
@@ -1096,6 +1169,12 @@ function buildSpineSource(origin) {
 
 async function handleRoute(rest, url, request, env, userToken, mode) {
   const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
+  // Settings capability: Eclipse appends declared setting keys as query params
+  // on every request. `searchMode` overrides the URL-path mode when present,
+  // so a single install can be switched Songs/Videos/Both from Eclipse's
+  // settings cog. Purely additive — falls back to the old path-based mode.
+  const settingMode = url.searchParams.get('searchMode');
+  const effectiveMode = (settingMode === 'both' || settingMode === 'songs' || settingMode === 'videos') ? settingMode : mode;
   // ── 8SPINE source listing ─────────────────────────────────────────────
   if (rest === '/8spine-source.json') return jsonRes(buildSpineSource(url.origin));
   // ── 8SPINE module code endpoints ─────────────────────────────────────
@@ -1118,11 +1197,11 @@ async function handleRoute(rest, url, request, env, userToken, mode) {
     });
   }
   if (rest === '/manifest.json' || rest === '/manifest') return jsonRes(buildManifest(mode));
-  if (rest === '/search') return jsonRes(await handleSearch(q, env, userToken, mode));
+  if (rest === '/search') return jsonRes(await handleSearch(q, env, userToken, effectiveMode));
   if (rest.startsWith('/stream/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleStream(id, env, userToken)); }
   if (rest.startsWith('/download/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return await proxyDownload(id, request, env, userToken); }
   if (rest.startsWith('/album/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleAlbum(id, env, userToken)); }
-  if (rest.startsWith('/artist/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleArtist(id, env, userToken, mode)); }
+  if (rest.startsWith('/artist/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleArtist(id, env, userToken, effectiveMode)); }
   if (rest.startsWith('/playlist/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handlePlaylist(id, env, userToken)); }
   return null;
 }
