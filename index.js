@@ -1,7 +1,15 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.4 (+ video playback object, + settings capability)
+// author: ricky | version: 2.9.5 (+ video playback object, + settings capability)
+// Changes from 2.9.4:
+//   - FIX: the AndroidNative/WebEmbedded "progressive" mp4 formats are often
+//     ONLY available as legacy itag 17 (144p 3GP, ~100kbps, odd aspect ratio)
+//     — that's what was showing up as a tiny squished/cropped video in
+//     Eclipse. pickVideoRenditions now requires height >= 240 to reject that
+//     legacy format, and fetchVideoInfo tries the iOS HLS manifest FIRST
+//     (it carries proper up-to-1080p adaptive video for real videos) before
+//     falling back to progressive mp4.
 // Changes from 2.9.3:
-//   - video lookup now tries multiple clients (AndroidNative progressive mp4,
+//   - video lookup tries multiple clients (AndroidNative progressive mp4,
 //     then WebEmbedded progressive mp4, then falls back to the iOS HLS
 //     manifest as a muxed source) instead of only AndroidNative — YouTube
 //     frequently omits progressive mp4 for a given client/video, so relying
@@ -742,17 +750,17 @@ async function resolveAndroidNative(trackId, env) {
 // separate, best-effort lookup for a muxed (video+audio in one file) source,
 // attached to the stream response as an extra `video` field.
 //
-// YouTube often omits the progressive "formats" array for a given client or
-// video, so we try a few sources in order before giving up:
-//   1. AndroidNative progressive mp4 (video/mp4 + mp4a audio in one file)
-//   2. WebEmbedded progressive mp4
-//   3. The iOS client's HLS manifest — for an actual video (not a plain
-//      song), this manifest already interleaves audio+video variants, so
-//      it qualifies as a muxed source Eclipse can play in video mode too.
+// IMPORTANT: YouTube's "progressive" formats array is frequently limited to
+// legacy itag 17 — a 144p 3GP file (~100kbps, odd/near-square aspect ratio)
+// left over from very old clients. That's what shows up as a tiny squished
+// video. We reject anything under 240p so that junk never gets used, and we
+// try the iOS HLS manifest FIRST since it carries genuine adaptive video
+// (up to 1080p) for real videos.
+const MIN_VIDEO_HEIGHT = 240;
 function pickVideoRenditions(sd) {
   const formats = sd?.formats || [];
   return formats
-    .filter(f => f.url && f.mimeType && f.mimeType.startsWith('video/mp4') && f.mimeType.includes('mp4a') && f.height)
+    .filter(f => f.url && f.mimeType && f.mimeType.startsWith('video/mp4') && f.mimeType.includes('mp4a') && (f.height || 0) >= MIN_VIDEO_HEIGHT)
     .map(f => ({ url: f.url, height: f.height, width: f.width || 0, mimeType: 'video/mp4' }))
     .sort((a, b) => b.height - a.height);
 }
@@ -763,7 +771,16 @@ function buildVideoInfo(sd) {
   return { url: best.url, mimeType: 'video/mp4', muxed: true, width: best.width || 0, height: best.height, renditions };
 }
 async function fetchVideoInfo(trackId, env, userToken) {
-  // 1) AndroidNative progressive mp4
+  // 1) iOS HLS manifest — for an actual video this already interleaves
+  //    proper audio+video variants up to 1080p, so try it first.
+  try {
+    const data = await fetchPlayerData(trackId, env, userToken);
+    const hlsUrl = data?.streamingData?.hlsManifestUrl;
+    if (hlsUrl) return { url: hlsUrl, mimeType: 'application/x-mpegURL', muxed: true };
+  } catch (e) {
+    console.log(LOG_PREFIX, `video lookup (iOS HLS) failed for ${trackId} (non-fatal):`, e.message);
+  }
+  // 2) AndroidNative progressive mp4 (only if >= 240p — rejects itag 17 junk)
   try {
     const data = await fetchPlayerDataAndroidNative(trackId, env);
     const info = buildVideoInfo(data?.streamingData);
@@ -771,21 +788,13 @@ async function fetchVideoInfo(trackId, env, userToken) {
   } catch (e) {
     console.log(LOG_PREFIX, `video lookup (AndroidNative) failed for ${trackId} (non-fatal):`, e.message);
   }
-  // 2) WebEmbedded progressive mp4
+  // 3) WebEmbedded progressive mp4 (same 240p floor)
   try {
     const data = await fetchPlayerDataWebEmbedded(trackId, env);
     const info = buildVideoInfo(data?.streamingData);
     if (info) return info;
   } catch (e) {
     console.log(LOG_PREFIX, `video lookup (WebEmbedded) failed for ${trackId} (non-fatal):`, e.message);
-  }
-  // 3) iOS HLS manifest as a muxed fallback (real videos carry video variants in it)
-  try {
-    const data = await fetchPlayerData(trackId, env, userToken);
-    const hlsUrl = data?.streamingData?.hlsManifestUrl;
-    if (hlsUrl) return { url: hlsUrl, mimeType: 'application/x-mpegURL', muxed: true };
-  } catch (e) {
-    console.log(LOG_PREFIX, `video lookup (iOS HLS) failed for ${trackId} (non-fatal):`, e.message);
   }
   return null;
 }
@@ -1050,7 +1059,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.4', description: v.description,
+    id: v.id, name: v.name, version: '2.9.5', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
