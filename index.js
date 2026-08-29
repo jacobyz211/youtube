@@ -1,6 +1,10 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.2 (sequential streaming + search fixes + 8SPINE support)
-// Changes from 2.9.1:
+// author: ricky | version: 2.10.0 (video playback + in-app search-mode setting)
+// Changes from 2.10.0:
+//   - handleStream now attaches a `video` object (per eclipsemusic.app/docs Video
+//     Playback spec) so Eclipse can show the fullscreen video toggle
+//   - New addon Settings capability: users pick Songs / Videos / Both from the
+//     settings cog in Eclipse instead of needing separate installs
 //   - handleStream: sequential instead of parallel (stops triggering YouTube bot detection)
 //   - fetchPlayerData: stop deleting visitor data on bot blocks (keeps cache valid)
 //   - handleSearch: backfill only for empty categories, keeps all 6 search types
@@ -714,13 +718,41 @@ function pickProgressiveFormat(sd) {
     .sort((a, b) => (a.bitrate || 0) - (b.bitrate || 0));
   return candidates[0] || null;
 }
+// ── Video support (eclipsemusic.app/docs "Video Playback") ───────────────
+// Progressive (muxed) mp4 formats carry both picture + sound in one file,
+// which is exactly what Eclipse wants for `video.muxed = true`.
+function pickVideoRenditions(sd) {
+  const formats = sd?.formats || [];
+  return formats
+    .filter(f => f.url && f.mimeType && f.mimeType.startsWith('video/mp4') && f.mimeType.includes('mp4a') && f.height)
+    .map(f => ({ url: f.url, height: f.height, width: f.width || 0, mimeType: 'video/mp4' }))
+    .sort((a, b) => b.height - a.height);
+}
+function buildVideoInfo(sd) {
+  const renditions = pickVideoRenditions(sd);
+  if (!renditions.length) return null;
+  const best = renditions[0];
+  return { url: best.url, mimeType: 'video/mp4', muxed: true, width: best.width, height: best.height, renditions };
+}
+// Standalone video lookup used when the resolver that won the audio race
+// (iOS/MWEB/etc.) doesn't itself carry a progressive video format.
+async function fetchVideoInfo(trackId, env) {
+  try {
+    const data = await fetchPlayerDataAndroidNative(trackId, env);
+    return buildVideoInfo(data?.streamingData);
+  } catch (e) {
+    console.log(LOG_PREFIX, `video fetch failed for ${trackId}:`, e.message);
+    return null;
+  }
+}
 
 async function resolveAndroidNative(trackId, env) {
   const data = await fetchPlayerDataAndroidNative(trackId, env);
-  const progressive = pickProgressiveFormat(data?.streamingData);
-  if (progressive?.url) return { url: progressive.url, format: 'mp4', quality: 'native' };
+  const video = buildVideoInfo(data?.streamingData);
   const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  if (best) return { url: best.url, format: 'm4a', quality: 'native', video };
+  const progressive = pickProgressiveFormat(data?.streamingData);
+  if (progressive?.url) return { url: progressive.url, format: 'm4a', quality: 'native', video };
   throw new Error('no usable format');
 }
 async function resolveIOS(trackId, env, userToken) {
@@ -778,7 +810,14 @@ async function handleStream(trackId, env, userToken) {
     try {
       const result = await resolver.run();
       if (result) {
-        console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}`);
+        // Audio always wins the race first; if the winning resolver didn't
+        // itself carry a muxed video rendition (e.g. iOS/MWEB HLS), do one
+        // extra lightweight lookup so the Eclipse video toggle still shows up.
+        if (!result.video) {
+          result.video = await fetchVideoInfo(trackId, env);
+        }
+        if (!result.video) delete result.video; // never send an empty/null video object
+        console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}${result.video ? ' (+video)' : ''}`);
         return result;
       }
     } catch (e) {
@@ -969,17 +1008,35 @@ function lastSegment(rest) { return rest.split('/').filter(Boolean).pop() || '';
 function buildManifest(mode) {
   const m = mode || 'both';
   const variants = {
-    both: { id: 'com.ricky.youtube-music', name: 'YouTube Music', description: 'Stream from YouTube Music — Songs & Videos, Albums, Artists, Playlists. HLS + AAC.' },
+    both: { id: 'com.ricky.youtube-music', name: 'YouTube Music', description: 'Stream from YouTube Music — Songs & Videos, Albums, Artists, Playlists. HLS + AAC + video.' },
     songs: { id: 'com.ricky.youtube-music-songs', name: 'YouTube Music — Songs', description: 'Stream from YouTube Music — Songs tab only. Albums, Artists & Playlists. HLS + AAC.' },
-    videos: { id: 'com.ricky.youtube-music-videos', name: 'YouTube Music — Videos', description: 'Stream from YouTube Music — Videos tab. Artists & Playlists. HLS + AAC.' },
+    videos: { id: 'com.ricky.youtube-music-videos', name: 'YouTube Music — Videos', description: 'Stream from YouTube Music — Videos tab. Artists & Playlists. HLS + AAC + video.' },
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.2', description: v.description,
+    id: v.id, name: v.name, version: '2.10.0', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
-    resources: ['search', 'stream', 'download', 'catalog'],
+    resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
     contentType: 'music',
+    // In-app settings — Eclipse renders this as a settings cog and appends
+    // the chosen value as `?searchMode=...` on every request (see
+    // eclipsemusic.app/docs → "Addon Settings"). This lets one install
+    // switch between Songs / Videos / Both instead of needing 3 addon URLs.
+    settings: [
+      {
+        key: 'searchMode',
+        type: 'select',
+        label: 'Search results',
+        help: 'Choose whether search returns songs, videos, or both.',
+        default: m,
+        options: [
+          { value: 'both', label: 'Songs & Videos' },
+          { value: 'songs', label: 'Songs only' },
+          { value: 'videos', label: 'Videos only' },
+        ],
+      },
+    ],
   };
 }
 
@@ -1004,7 +1061,7 @@ function buildSpineModuleSource(mode, origin) {
     "var MODULE = {",
     "  id: '" + v.id + "',",
     "  name: '" + v.name + "',",
-    "  version: '2.9.2',",
+    "  version: '2.10.0',",
     "  labels: ['AAC', 'HLS', 'FREE'],",
     "",
     "  searchTracks: function(query, limit) {",
@@ -1067,7 +1124,7 @@ function buildSpineSource(origin) {
         id: 'ytmusic-8spine-both',
         name: 'YouTube Music',
         author: 'Ricky',
-        version: '2.9.2',
+        version: '2.10.0',
         description: 'Full YouTube Music catalog — Songs & Videos, Albums, Artists, Playlists. HLS + AAC. No account required.',
         labels: ['AAC', 'HLS', 'FREE'],
         download: `${origin}/8spine.js`,
@@ -1076,7 +1133,7 @@ function buildSpineSource(origin) {
         id: 'ytmusic-8spine-songs',
         name: 'YouTube Music — Songs',
         author: 'Ricky',
-        version: '2.9.2',
+        version: '2.10.0',
         description: 'YouTube Music Songs tab only, plus Albums, Artists & Playlists. HLS + AAC. No account required.',
         labels: ['AAC', 'HLS', 'FREE'],
         download: `${origin}/8spine-songs.js`,
@@ -1085,7 +1142,7 @@ function buildSpineSource(origin) {
         id: 'ytmusic-8spine-videos',
         name: 'YouTube Music — Videos',
         author: 'Ricky',
-        version: '2.9.2',
+        version: '2.10.0',
         description: 'YouTube Music Videos tab, plus Artists & Playlists. HLS + AAC. No account required.',
         labels: ['AAC', 'HLS', 'FREE'],
         download: `${origin}/8spine-videos.js`,
@@ -1096,6 +1153,12 @@ function buildSpineSource(origin) {
 
 async function handleRoute(rest, url, request, env, userToken, mode) {
   const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
+  // Eclipse appends the addon's declared settings as query params on every
+  // request (see docs → "Addon Settings" → "How values reach you"). The
+  // `searchMode` setting takes priority over the URL-path mode (/u/{token}/songs
+  // or /videos) so a single install can be switched from inside the app.
+  const settingMode = url.searchParams.get('searchMode');
+  const effectiveMode = (settingMode === 'both' || settingMode === 'songs' || settingMode === 'videos') ? settingMode : mode;
   // ── 8SPINE source listing ─────────────────────────────────────────────
   if (rest === '/8spine-source.json') return jsonRes(buildSpineSource(url.origin));
   // ── 8SPINE module code endpoints ─────────────────────────────────────
@@ -1118,11 +1181,11 @@ async function handleRoute(rest, url, request, env, userToken, mode) {
     });
   }
   if (rest === '/manifest.json' || rest === '/manifest') return jsonRes(buildManifest(mode));
-  if (rest === '/search') return jsonRes(await handleSearch(q, env, userToken, mode));
+  if (rest === '/search') return jsonRes(await handleSearch(q, env, userToken, effectiveMode));
   if (rest.startsWith('/stream/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleStream(id, env, userToken)); }
   if (rest.startsWith('/download/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return await proxyDownload(id, request, env, userToken); }
   if (rest.startsWith('/album/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleAlbum(id, env, userToken)); }
-  if (rest.startsWith('/artist/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleArtist(id, env, userToken, mode)); }
+  if (rest.startsWith('/artist/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleArtist(id, env, userToken, effectiveMode)); }
   if (rest.startsWith('/playlist/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handlePlaylist(id, env, userToken)); }
   return null;
 }
@@ -1233,7 +1296,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
 </div>
 <div class="warn">Each URL is unique to your session. Regenerating creates a new URL; old ones keep working.</div>
 </div>
-<footer>YouTube Music for Eclipse &middot; v2.9.2 &middot; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse &middot; v2.10.0 &middot; Cloudflare Workers</footer>
 <script>
 let tok=null,urls={};
 function base(){return location.origin}
