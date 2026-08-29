@@ -1,8 +1,14 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.3 (+ video playback object, + settings capability)
+// author: ricky | version: 2.9.4 (+ video playback object, + settings capability)
+// Changes from 2.9.3:
+//   - video lookup now tries multiple clients (AndroidNative progressive mp4,
+//     then WebEmbedded progressive mp4, then falls back to the iOS HLS
+//     manifest as a muxed source) instead of only AndroidNative — YouTube
+//     frequently omits progressive mp4 for a given client/video, so relying
+//     on just one source meant the `video` field was almost never present.
 // Changes from 2.9.2:
 //   - ADDITIVE ONLY: /stream now also attaches a `video` object (per
-//     eclipsemusic.app/docs "Video Playback") when a muxed mp4 rendition
+//     eclipsemusic.app/docs "Video Playback") when a muxed rendition
 //     exists. The existing audio url/format resolution logic is UNCHANGED.
 //   - New addon Settings capability (searchMode, videoQuality) so users can
 //     pick Songs/Videos/Both and preferred video quality from Eclipse's
@@ -733,13 +739,21 @@ async function resolveAndroidNative(trackId, env) {
 
 // ── Video support (ADDITIVE ONLY — eclipsemusic.app/docs "Video Playback") ──
 // This never touches the audio url/format decided above. It's a completely
-// separate, best-effort lookup for a muxed (video+audio in one file) mp4
-// rendition, attached to the stream response as an extra `video` field.
+// separate, best-effort lookup for a muxed (video+audio in one file) source,
+// attached to the stream response as an extra `video` field.
+//
+// YouTube often omits the progressive "formats" array for a given client or
+// video, so we try a few sources in order before giving up:
+//   1. AndroidNative progressive mp4 (video/mp4 + mp4a audio in one file)
+//   2. WebEmbedded progressive mp4
+//   3. The iOS client's HLS manifest — for an actual video (not a plain
+//      song), this manifest already interleaves audio+video variants, so
+//      it qualifies as a muxed source Eclipse can play in video mode too.
 function pickVideoRenditions(sd) {
   const formats = sd?.formats || [];
   return formats
     .filter(f => f.url && f.mimeType && f.mimeType.startsWith('video/mp4') && f.mimeType.includes('mp4a') && f.height)
-    .map(f => ({ url: f.url, height: f.height, mimeType: 'video/mp4' }))
+    .map(f => ({ url: f.url, height: f.height, width: f.width || 0, mimeType: 'video/mp4' }))
     .sort((a, b) => b.height - a.height);
 }
 function buildVideoInfo(sd) {
@@ -748,14 +762,32 @@ function buildVideoInfo(sd) {
   const best = renditions[0];
   return { url: best.url, mimeType: 'video/mp4', muxed: true, width: best.width || 0, height: best.height, renditions };
 }
-async function fetchVideoInfo(trackId, env) {
+async function fetchVideoInfo(trackId, env, userToken) {
+  // 1) AndroidNative progressive mp4
   try {
     const data = await fetchPlayerDataAndroidNative(trackId, env);
-    return buildVideoInfo(data?.streamingData);
+    const info = buildVideoInfo(data?.streamingData);
+    if (info) return info;
   } catch (e) {
-    console.log(LOG_PREFIX, `video lookup failed for ${trackId} (non-fatal):`, e.message);
-    return null;
+    console.log(LOG_PREFIX, `video lookup (AndroidNative) failed for ${trackId} (non-fatal):`, e.message);
   }
+  // 2) WebEmbedded progressive mp4
+  try {
+    const data = await fetchPlayerDataWebEmbedded(trackId, env);
+    const info = buildVideoInfo(data?.streamingData);
+    if (info) return info;
+  } catch (e) {
+    console.log(LOG_PREFIX, `video lookup (WebEmbedded) failed for ${trackId} (non-fatal):`, e.message);
+  }
+  // 3) iOS HLS manifest as a muxed fallback (real videos carry video variants in it)
+  try {
+    const data = await fetchPlayerData(trackId, env, userToken);
+    const hlsUrl = data?.streamingData?.hlsManifestUrl;
+    if (hlsUrl) return { url: hlsUrl, mimeType: 'application/x-mpegURL', muxed: true };
+  } catch (e) {
+    console.log(LOG_PREFIX, `video lookup (iOS HLS) failed for ${trackId} (non-fatal):`, e.message);
+  }
+  return null;
 }
 async function resolveIOS(trackId, env, userToken) {
   const data = await fetchPlayerData(trackId, env, userToken);
@@ -817,7 +849,7 @@ async function handleStream(trackId, env, userToken) {
         // "Video Playback"). This is wrapped so it can never affect or block
         // the audio result above — worst case, `video` is just left unset.
         try {
-          const video = await fetchVideoInfo(trackId, env);
+          const video = await fetchVideoInfo(trackId, env, userToken);
           if (video) result.video = video;
         } catch (e) {
           console.log(LOG_PREFIX, `video attach skipped for ${trackId}:`, e.message);
@@ -1018,7 +1050,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.3', description: v.description,
+    id: v.id, name: v.name, version: '2.9.4', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
