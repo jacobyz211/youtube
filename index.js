@@ -1,13 +1,21 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.5 (+ video playback object, + settings capability)
+// author: ricky | version: 2.9.6 (+ video playback object, + settings capability)
+// Changes from 2.9.5:
+//   - FIX: logs showed the iOS HLS call getting bot-blocked ("Sign in to
+//     confirm you're not a bot") on EVERY /stream request once it was moved
+//     to run first — that's an extra iOS API call per track, which is
+//     exactly what triggers YouTube's bot detection. Reverted the order:
+//     AndroidNative/WebEmbedded progressive (>=240p) are tried first since
+//     AndroidNative already ran for audio anyway, and iOS HLS is now only a
+//     last resort for tracks where neither progressive source has anything.
+//   - Added a success log line when a video actually attaches, so future
+//     `wrangler tail` output shows which source won instead of only failures.
 // Changes from 2.9.4:
 //   - FIX: the AndroidNative/WebEmbedded "progressive" mp4 formats are often
 //     ONLY available as legacy itag 17 (144p 3GP, ~100kbps, odd aspect ratio)
 //     — that's what was showing up as a tiny squished/cropped video in
-//     Eclipse. pickVideoRenditions now requires height >= 240 to reject that
-//     legacy format, and fetchVideoInfo tries the iOS HLS manifest FIRST
-//     (it carries proper up-to-1080p adaptive video for real videos) before
-//     falling back to progressive mp4.
+//     Eclipse. pickVideoRenditions requires height >= 240 to reject that
+//     legacy format.
 // Changes from 2.9.3:
 //   - video lookup tries multiple clients (AndroidNative progressive mp4,
 //     then WebEmbedded progressive mp4, then falls back to the iOS HLS
@@ -751,11 +759,16 @@ async function resolveAndroidNative(trackId, env) {
 // attached to the stream response as an extra `video` field.
 //
 // IMPORTANT: YouTube's "progressive" formats array is frequently limited to
-// legacy itag 17 — a 144p 3GP file (~100kbps, odd/near-square aspect ratio)
-// left over from very old clients. That's what shows up as a tiny squished
-// video. We reject anything under 240p so that junk never gets used, and we
-// try the iOS HLS manifest FIRST since it carries genuine adaptive video
-// (up to 1080p) for real videos.
+// legacy itag 17 (144p 3GP, ~100kbps, odd aspect ratio) — that's what showed
+// up as a tiny squished video. We reject anything under 240p.
+//
+// ORDER MATTERS: AndroidNative/WebEmbedded progressive are tried FIRST
+// because AndroidNative already ran once for audio — checking its result
+// again here costs nothing extra client-wise. The iOS HLS manifest is only
+// tried as a LAST resort: hitting it on every single track (as a previous
+// version did) adds one extra iOS API call per stream request, and that's
+// exactly the repeated-request pattern that gets iOS bot-blocked
+// ("Sign in to confirm you're not a bot") — confirmed in production logs.
 const MIN_VIDEO_HEIGHT = 240;
 function pickVideoRenditions(sd) {
   const formats = sd?.formats || [];
@@ -771,30 +784,30 @@ function buildVideoInfo(sd) {
   return { url: best.url, mimeType: 'video/mp4', muxed: true, width: best.width || 0, height: best.height, renditions };
 }
 async function fetchVideoInfo(trackId, env, userToken) {
-  // 1) iOS HLS manifest — for an actual video this already interleaves
-  //    proper audio+video variants up to 1080p, so try it first.
-  try {
-    const data = await fetchPlayerData(trackId, env, userToken);
-    const hlsUrl = data?.streamingData?.hlsManifestUrl;
-    if (hlsUrl) return { url: hlsUrl, mimeType: 'application/x-mpegURL', muxed: true };
-  } catch (e) {
-    console.log(LOG_PREFIX, `video lookup (iOS HLS) failed for ${trackId} (non-fatal):`, e.message);
-  }
-  // 2) AndroidNative progressive mp4 (only if >= 240p — rejects itag 17 junk)
+  // 1) AndroidNative progressive mp4 (>= 240p — rejects itag 17 junk)
   try {
     const data = await fetchPlayerDataAndroidNative(trackId, env);
     const info = buildVideoInfo(data?.streamingData);
-    if (info) return info;
+    if (info) { console.log(LOG_PREFIX, `video attached via AndroidNative for ${trackId} (${info.height}p)`); return info; }
   } catch (e) {
     console.log(LOG_PREFIX, `video lookup (AndroidNative) failed for ${trackId} (non-fatal):`, e.message);
   }
-  // 3) WebEmbedded progressive mp4 (same 240p floor)
+  // 2) WebEmbedded progressive mp4 (same 240p floor)
   try {
     const data = await fetchPlayerDataWebEmbedded(trackId, env);
     const info = buildVideoInfo(data?.streamingData);
-    if (info) return info;
+    if (info) { console.log(LOG_PREFIX, `video attached via WebEmbedded for ${trackId} (${info.height}p)`); return info; }
   } catch (e) {
     console.log(LOG_PREFIX, `video lookup (WebEmbedded) failed for ${trackId} (non-fatal):`, e.message);
+  }
+  // 3) LAST RESORT: iOS HLS manifest. Only reached when neither progressive
+  //    source had a >=240p rendition, to minimize extra iOS API calls.
+  try {
+    const data = await fetchPlayerData(trackId, env, userToken);
+    const hlsUrl = data?.streamingData?.hlsManifestUrl;
+    if (hlsUrl) { console.log(LOG_PREFIX, `video attached via iOS HLS for ${trackId}`); return { url: hlsUrl, mimeType: 'application/x-mpegURL', muxed: true }; }
+  } catch (e) {
+    console.log(LOG_PREFIX, `video lookup (iOS HLS) failed for ${trackId} (non-fatal):`, e.message);
   }
   return null;
 }
@@ -1059,7 +1072,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.5', description: v.description,
+    id: v.id, name: v.name, version: '2.9.6', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
