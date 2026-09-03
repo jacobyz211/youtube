@@ -1,5 +1,37 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.6 (+ video playback object, + settings capability)
+// author: ricky | version: 2.9.8 (more fallback clients + bot-detection hardening)
+// Changes from 2.9.7:
+//   - Added 3 more InnerTube clients to the /stream fallback chain:
+//     AndroidMusic (the YT Music app's own client — was already implemented
+//     for /download but never tried for streaming), TVHTML5 ("tv" in
+//     yt-dlp's current default client list), and
+//     TVHTML5_SIMPLY_EMBEDDED_PLAYER ("tv_embedded", paired with a
+//     thirdParty embedUrl like WebEmbedded). Chain is now 9 clients across
+//     4 fingerprint families (Android app, iOS app, web, TV surface)
+//     instead of 6 across 3 — TV-surface clients are a fundamentally
+//     different fingerprint from mobile/web, useful when those two families
+//     get flagged together.
+// Changes from 2.9.6:
+//   - FIX: AndroidNative/WebEmbedded/MWEB/WebCreator/AndroidVR player calls
+//     previously sent NO visitorData at all in context.client — a request
+//     claiming to be a real app client but with zero visitor identity is a
+//     strong bot signal under YouTube's tightened 2026 enforcement (which now
+//     also scrutinizes ANDROID/iOS, not just WEB). Every player-data
+//     resolver now attaches a real visitorData via getVisitorData() before
+//     the PO token gets layered on.
+//   - FIX: withPoToken() used to overwrite context.client.visitorData with a
+//     SEPARATELY cached "ytm:po_visitor_data" value that had nothing to do
+//     with the visitorData already on the request — a mismatched
+//     PO-token/visitorData pairing looks like tampering to BotGuard. It now
+//     only attaches the PO token itself and leaves visitorData alone.
+//   - Added a small randomized delay (150-400ms) between fallback resolver
+//     attempts in handleStream — back-to-back player calls with zero
+//     spacing from the same Workers IP is a machine-pattern signal on its
+//     own, independent of which client each call claims to be. No delay is
+//     added before the first attempt.
+//   - Added a diagnostic log line when no PO token is cached, so a dead
+//     PO-token generator shows up immediately in `wrangler tail` instead of
+//     silently degrading every request.
 // Changes from 2.9.5:
 //   - FIX: logs showed the iOS HLS call getting bot-blocked ("Sign in to
 //     confirm you're not a bot") on EVERY /stream request once it was moved
@@ -53,6 +85,16 @@ const MWEB_CLIENT = { clientName: 'MWEB', clientVersion: '2.20260810.01.00', hl:
 const MWEB_UA = 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36';
 const WEB_CREATOR_CLIENT = { clientName: 'WEB_CREATOR', clientVersion: '1.20260530.01.00', clientScreen: 'EMBED', hl: 'en', gl: 'US' };
 const WEB_EMBEDDED_CLIENT = { clientName: 'WEB_EMBEDDED_PLAYER', clientVersion: '2.20260530.01.00', hl: 'en', gl: 'US' };
+// NEW (2.9.8): additional InnerTube clients for the /stream fallback chain.
+// TVHTML5 ("tv") and TVHTML5_SIMPLY_EMBEDDED_PLAYER ("tv_embedded") are two
+// of yt-dlp's current default extraction clients alongside android/ios/mweb
+// — TV-surface clients are a different fingerprint family from mobile/web
+// entirely, which is useful when mobile+web clients are all getting flagged
+// together. TV_EMBEDDED additionally carries a thirdParty.embedUrl like
+// WebEmbedded, which sometimes recovers videos the plain TV client can't.
+const TVHTML5_CLIENT = { clientName: 'TVHTML5', clientVersion: '7.20260815.16.00', hl: 'en', gl: 'US' };
+const TVHTML5_UA = 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.5) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/2.2 TV Safari/537.36';
+const TV_EMBEDDED_CLIENT = { clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0', hl: 'en', gl: 'US' };
 
 const SEARCH_PARAMS = {
   songs: 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
@@ -85,13 +127,7 @@ async function getPoVisitorData(env) {
 async function withPoToken(body, env) {
   const poToken = await getPoToken(env);
   if (!poToken) return body;
-  const enriched = { ...body };
-  enriched.serviceIntegrityDimensions = { poToken };
-  const poVisitorData = await getPoVisitorData(env);
-  if (poVisitorData && enriched.context?.client) {
-    enriched.context = { ...enriched.context, client: { ...enriched.context.client, visitorData: poVisitorData } };
-  }
-  return enriched;
+  return { ...body, serviceIntegrityDimensions: { poToken } };
 }
 async function tryRefreshPoToken(env) {
   const generatorUrl = env?.YT_PO_TOKEN_GENERATOR_URL;
@@ -640,9 +676,10 @@ async function fetchPlayerData(trackId, env, userToken) {
   return data;
 }
 
-async function fetchPlayerDataAndroid(trackId, env) {
+async function fetchPlayerDataAndroid(trackId, env, userToken) {
   const cookie = env?.YT_COOKIE || '';
-  const baseBody = { context: { client: ANDROID_MUSIC_CLIENT }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
+  const visitorData = await getVisitorData(env, userToken);
+  const baseBody = { context: { client: { ...ANDROID_MUSIC_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const headers = { 'Content-Type': 'application/json', 'User-Agent': ANDROID_MUSIC_UA, 'X-Goog-Api-Format-Version': '2' };
   if (cookie) headers['Cookie'] = cookie;
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
@@ -654,8 +691,43 @@ async function fetchPlayerDataAndroid(trackId, env) {
   return data;
 }
 
-async function fetchPlayerDataMWeb(trackId, env) {
-  const baseBody = { context: { client: MWEB_CLIENT }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
+// NEW (2.9.8): TVHTML5 — a fully different fingerprint family (TV surface,
+// not mobile/web), useful when mobile+web clients are getting flagged as a
+// group. No thirdParty embed context — this is the plain "TV app" identity.
+async function fetchPlayerDataTV(trackId, env, userToken) {
+  const visitorData = await getVisitorData(env, userToken);
+  const baseBody = { context: { client: { ...TVHTML5_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
+  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': TVHTML5_UA },
+    body: JSON.stringify(await withPoToken(baseBody, env)),
+  });
+  if (!resp.ok) throw new Error(`${LOG_PREFIX} TV player HTTP ${resp.status}`);
+  const data = await resp.json();
+  if (data?.playabilityStatus?.status !== 'OK') throw new Error(`${LOG_PREFIX} TV blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
+  return data;
+}
+
+// NEW (2.9.8): TVHTML5_SIMPLY_EMBEDDED_PLAYER — the TV-embed variant, paired
+// with a thirdParty.embedUrl like WebEmbedded. Historically recovers videos
+// that reject the plain TV client (e.g. some age/region-gated content).
+async function fetchPlayerDataTVEmbedded(trackId, env, userToken) {
+  const visitorData = await getVisitorData(env, userToken);
+  const baseBody = { context: { client: { ...TV_EMBEDDED_CLIENT, visitorData }, thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
+  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': TVHTML5_UA },
+    body: JSON.stringify(await withPoToken(baseBody, env)),
+  });
+  if (!resp.ok) throw new Error(`${LOG_PREFIX} TVEmbedded player HTTP ${resp.status}`);
+  const data = await resp.json();
+  if (data?.playabilityStatus?.status !== 'OK') throw new Error(`${LOG_PREFIX} TVEmbedded blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
+  return data;
+}
+
+async function fetchPlayerDataMWeb(trackId, env, userToken) {
+  const visitorData = await getVisitorData(env, userToken);
+  const baseBody = { context: { client: { ...MWEB_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
     headers: {
@@ -671,8 +743,9 @@ async function fetchPlayerDataMWeb(trackId, env) {
   return data;
 }
 
-async function fetchPlayerDataWebCreator(trackId, env) {
-  const baseBody = { context: { client: WEB_CREATOR_CLIENT, thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
+async function fetchPlayerDataWebCreator(trackId, env, userToken) {
+  const visitorData = await getVisitorData(env, userToken);
+  const baseBody = { context: { client: { ...WEB_CREATOR_CLIENT, visitorData }, thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
     headers: {
@@ -688,8 +761,9 @@ async function fetchPlayerDataWebCreator(trackId, env) {
   return data;
 }
 
-async function fetchPlayerDataAndroidNative(trackId, env) {
-  const baseBody = { context: { client: ANDROID_NATIVE_CLIENT }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
+async function fetchPlayerDataAndroidNative(trackId, env, userToken) {
+  const visitorData = await getVisitorData(env, userToken);
+  const baseBody = { context: { client: { ...ANDROID_NATIVE_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_NATIVE_UA, 'X-Goog-Api-Format-Version': '2' },
@@ -701,8 +775,9 @@ async function fetchPlayerDataAndroidNative(trackId, env) {
   return data;
 }
 
-async function fetchPlayerDataWebEmbedded(trackId, env) {
-  const baseBody = { context: { client: WEB_EMBEDDED_CLIENT, thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
+async function fetchPlayerDataWebEmbedded(trackId, env, userToken) {
+  const visitorData = await getVisitorData(env, userToken);
+  const baseBody = { context: { client: { ...WEB_EMBEDDED_CLIENT, visitorData }, thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
     headers: {
@@ -718,8 +793,9 @@ async function fetchPlayerDataWebEmbedded(trackId, env) {
   return data;
 }
 
-async function fetchPlayerDataAndroidVR(trackId, env) {
-  const baseBody = { context: { client: ANDROID_VR_CLIENT }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
+async function fetchPlayerDataAndroidVR(trackId, env, userToken) {
+  const visitorData = await getVisitorData(env, userToken);
+  const baseBody = { context: { client: { ...ANDROID_VR_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_VR_UA, 'X-Goog-Api-Format-Version': '2' },
@@ -744,10 +820,38 @@ function pickProgressiveFormat(sd) {
   return candidates[0] || null;
 }
 
-async function resolveAndroidNative(trackId, env) {
-  const data = await fetchPlayerDataAndroidNative(trackId, env);
+async function resolveAndroidNative(trackId, env, userToken) {
+  const data = await fetchPlayerDataAndroidNative(trackId, env, userToken);
   const progressive = pickProgressiveFormat(data?.streamingData);
   if (progressive?.url) return { url: progressive.url, format: 'mp4', quality: 'native' };
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  throw new Error('no usable format');
+}
+// NEW (2.9.8): the YouTube Music app's own client identity. It was already
+// implemented (fetchPlayerDataAndroid) and used for /download, but was never
+// tried during /stream — a natural gap to close since it's the exact client
+// a real YT Music session presents.
+async function resolveAndroidMusic(trackId, env, userToken) {
+  const data = await fetchPlayerDataAndroid(trackId, env, userToken);
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  throw new Error('no usable format');
+}
+// NEW (2.9.8): TVHTML5 — different fingerprint family (TV surface).
+async function resolveTV(trackId, env, userToken) {
+  const data = await fetchPlayerDataTV(trackId, env, userToken);
+  const hlsUrl = data?.streamingData?.hlsManifestUrl;
+  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  throw new Error('no usable format');
+}
+// NEW (2.9.8): TVHTML5_SIMPLY_EMBEDDED_PLAYER — TV-embed variant.
+async function resolveTVEmbedded(trackId, env, userToken) {
+  const data = await fetchPlayerDataTVEmbedded(trackId, env, userToken);
+  const hlsUrl = data?.streamingData?.hlsManifestUrl;
+  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
   const best = pickBestAudio(data?.streamingData);
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
@@ -786,7 +890,7 @@ function buildVideoInfo(sd) {
 async function fetchVideoInfo(trackId, env, userToken) {
   // 1) AndroidNative progressive mp4 (>= 240p — rejects itag 17 junk)
   try {
-    const data = await fetchPlayerDataAndroidNative(trackId, env);
+    const data = await fetchPlayerDataAndroidNative(trackId, env, userToken);
     const info = buildVideoInfo(data?.streamingData);
     if (info) { console.log(LOG_PREFIX, `video attached via AndroidNative for ${trackId} (${info.height}p)`); return info; }
   } catch (e) {
@@ -794,7 +898,7 @@ async function fetchVideoInfo(trackId, env, userToken) {
   }
   // 2) WebEmbedded progressive mp4 (same 240p floor)
   try {
-    const data = await fetchPlayerDataWebEmbedded(trackId, env);
+    const data = await fetchPlayerDataWebEmbedded(trackId, env, userToken);
     const info = buildVideoInfo(data?.streamingData);
     if (info) { console.log(LOG_PREFIX, `video attached via WebEmbedded for ${trackId} (${info.height}p)`); return info; }
   } catch (e) {
@@ -817,32 +921,32 @@ async function resolveIOS(trackId, env, userToken) {
   if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
   throw new Error('no HLS');
 }
-async function resolveMWeb(trackId, env) {
-  const data = await fetchPlayerDataMWeb(trackId, env);
+async function resolveMWeb(trackId, env, userToken) {
+  const data = await fetchPlayerDataMWeb(trackId, env, userToken);
   const hlsUrl = data?.streamingData?.hlsManifestUrl;
   if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
   const best = pickBestAudio(data?.streamingData);
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
 }
-async function resolveWebCreator(trackId, env) {
-  const data = await fetchPlayerDataWebCreator(trackId, env);
+async function resolveWebCreator(trackId, env, userToken) {
+  const data = await fetchPlayerDataWebCreator(trackId, env, userToken);
   const hlsUrl = data?.streamingData?.hlsManifestUrl;
   if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
   const best = pickBestAudio(data?.streamingData);
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
 }
-async function resolveWebEmbedded(trackId, env) {
-  const data = await fetchPlayerDataWebEmbedded(trackId, env);
+async function resolveWebEmbedded(trackId, env, userToken) {
+  const data = await fetchPlayerDataWebEmbedded(trackId, env, userToken);
   const hlsUrl = data?.streamingData?.hlsManifestUrl;
   if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
   const best = pickBestAudio(data?.streamingData);
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
 }
-async function resolveAndroidVR(trackId, env) {
-  const data = await fetchPlayerDataAndroidVR(trackId, env);
+async function resolveAndroidVR(trackId, env, userToken) {
+  const data = await fetchPlayerDataAndroidVR(trackId, env, userToken);
   const best = pickBestAudio(data?.streamingData);
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
@@ -854,15 +958,32 @@ async function resolveAndroidVR(trackId, env) {
 // "Sign in to confirm you're not a bot". Now: try one at a time, return on
 // first success. Best case = 1 API call, worst case = 6 (but sequential).
 async function handleStream(trackId, env, userToken) {
+  // NEW (2.9.8): AndroidMusic, TV, and TVEmbedded added to the fallback
+  // chain — 9 clients total spanning 4 distinct fingerprint families
+  // (Android app, iOS app, mobile/desktop web, TV surface) instead of 6
+  // spanning 3. More clients means more chances at a non-blocked response,
+  // but a worst-case burst is now 9 calls instead of 6 — the inter-attempt
+  // delay below matters more with this list, not less.
   const resolvers = [
-    { name: 'AndroidNative', run: () => resolveAndroidNative(trackId, env) },
+    { name: 'AndroidNative', run: () => resolveAndroidNative(trackId, env, userToken) },
+    { name: 'AndroidMusic', run: () => resolveAndroidMusic(trackId, env, userToken) },
     { name: 'iOS', run: () => resolveIOS(trackId, env, userToken) },
-    { name: 'MWEB', run: () => resolveMWeb(trackId, env) },
-    { name: 'WebCreator', run: () => resolveWebCreator(trackId, env) },
-    { name: 'WebEmbedded', run: () => resolveWebEmbedded(trackId, env) },
-    { name: 'AndroidVR', run: () => resolveAndroidVR(trackId, env) },
+    { name: 'MWEB', run: () => resolveMWeb(trackId, env, userToken) },
+    { name: 'WebCreator', run: () => resolveWebCreator(trackId, env, userToken) },
+    { name: 'WebEmbedded', run: () => resolveWebEmbedded(trackId, env, userToken) },
+    { name: 'TV', run: () => resolveTV(trackId, env, userToken) },
+    { name: 'TVEmbedded', run: () => resolveTVEmbedded(trackId, env, userToken) },
+    { name: 'AndroidVR', run: () => resolveAndroidVR(trackId, env, userToken) },
   ];
-  for (const resolver of resolvers) {
+  for (let i = 0; i < resolvers.length; i++) {
+    const resolver = resolvers[i];
+    // FIX (2.9.7): small randomized delay before each fallback attempt.
+    // Firing back-to-back player-API calls from the same Workers IP with
+    // zero spacing is itself a machine-pattern signature, independent of
+    // which client each call claims to be. Only sleep BETWEEN attempts
+    // (never before the first) so the common case — first resolver
+    // succeeds — pays no extra latency.
+    if (i > 0) await new Promise(r => setTimeout(r, 150 + Math.floor(Math.random() * 250)));
     try {
       const result = await resolver.run();
       if (result) {
@@ -886,7 +1007,7 @@ async function handleStream(trackId, env, userToken) {
 }
 
 async function proxyDownload(trackId, incomingRequest, env, userToken) {
-  const data = await fetchPlayerDataAndroid(trackId, env);
+  const data = await fetchPlayerDataAndroid(trackId, env, userToken);
   const sd = data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for download`);
   const best = pickBestAudio(sd);
@@ -1072,7 +1193,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.6', description: v.description,
+    id: v.id, name: v.name, version: '2.9.8', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
@@ -1404,7 +1525,12 @@ export default {
 
     if (env?.YT_PO_TOKEN_GENERATOR_URL && env?.UPSTASH_REDIS_REST_URL) {
       const cached = await upstashCmd(env, 'GET', 'ytm:po_token');
-      if (!cached) tryRefreshPoToken(env);
+      if (!cached) {
+        console.log(LOG_PREFIX, 'No cached PO token — requests will run without BotGuard attestation until refresh completes');
+        tryRefreshPoToken(env);
+      }
+    } else if (!env?.YT_PO_TOKEN_GENERATOR_URL) {
+      console.log(LOG_PREFIX, 'YT_PO_TOKEN_GENERATOR_URL not configured — running with no PO token support at all');
     }
 
     if (path === '/') return htmlRes(buildPage());
