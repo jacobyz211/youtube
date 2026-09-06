@@ -1,5 +1,29 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.8 (more fallback clients + bot-detection hardening)
+// author: ricky | version: 2.9.11 (real PO token generator support)
+// Changes from 2.9.10:
+//   - FIX: tryRefreshPoToken() sent a bare GET to YT_PO_TOKEN_GENERATOR_URL.
+//     Real BotGuard-attestation PO token generators — e.g. bgutil-ytdlp-pot-
+//     provider (github.com/Brainicism/bgutil-ytdlp-pot-provider), the same
+//     LuanRT BgUtils-based approach clients like Metrolist use internally —
+//     expose POST /get_pot with a JSON body, not GET. Fixed to POST an empty
+//     JSON body; the response fields (po_token, visitor_data) already
+//     matched what this function expected, so no other changes were needed.
+//   - This addon's PO-token plumbing (env var, Upstash caching, withPoToken)
+//     was already correct — it just never had a real generator wired up
+//     behind it. Deploy bgutil-ytdlp-pot-provider (Docker image works on
+//     Render/Fly/any host with a persistent process — NOT Cloudflare
+//     Workers, which can't run its BotGuard interpreter) and point
+//     YT_PO_TOKEN_GENERATOR_URL at its /get_pot endpoint to actually use
+//     this path instead of running with zero attestation.
+// Changes from 2.9.9 (REVERTED in 2.9.10):
+//   - 2.9.9 had skipped clients believed to need a PO token when none was
+//     cached. Production logs showed AndroidNative resolving on the FIRST
+//     attempt with zero bot errors even with no PO token configured — that
+//     shortcut removed the most reliable client, so 2.9.10 reverted it.
+//     handleStream always tries all 9 clients again, same order as 2.9.8.
+// Changes from 2.9.8:
+//   - env.YT_COOKIE is now sent on the TV and TVEmbedded player calls
+//     (previously the only two resolvers missing it).
 // Changes from 2.9.7:
 //   - Added 3 more InnerTube clients to the /stream fallback chain:
 //     AndroidMusic (the YT Music app's own client — was already implemented
@@ -133,7 +157,18 @@ async function tryRefreshPoToken(env) {
   const generatorUrl = env?.YT_PO_TOKEN_GENERATOR_URL;
   if (!generatorUrl) return;
   try {
-    const res = await fetch(generatorUrl, { cf: { cacheTtl: 0 } });
+    // FIX (2.9.11): a real PO-token generator like bgutil-ytdlp-pot-provider
+    // (github.com/Brainicism/bgutil-ytdlp-pot-provider) — the same LuanRT
+    // BotGuard-attestation approach Metrolist and yt-dlp itself rely on —
+    // exposes POST /get_pot, not a bare GET. An empty JSON body is enough to
+    // get a session-scoped token; its response fields (po_token,
+    // visitor_data) already match what this function reads below.
+    const res = await fetch(generatorUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+      cf: { cacheTtl: 0 },
+    });
     if (!res.ok) return;
     const { po_token, visitor_data } = await res.json();
     if (po_token) {
@@ -228,7 +263,6 @@ function bestThumbnail(thumbs) {
   const best = thumbs.reduce((b, t) => ((t.width || 0) > (b.width || 0) ? t : b));
   return upscaleArtwork(best.url);
 }
-
 function runsText(runs) { return (runs || []).map(r => r.text || '').join('').trim(); }
 function parseInfoRuns(runs) {
   if (!runs?.length) return { artist: '', album: '', duration: '' };
@@ -380,7 +414,6 @@ async function browseChannelVideos(channelId, env, userToken) {
   if (!videosParams) return channelData;
   return ytmPost(`/youtubei/v1/browse?key=${getApiKey(env)}`, { context: { client: WEB_REMIX_CONTEXT }, browseId: videosBrowseId, params: videosParams }, env, userToken);
 }
-
 function extractChannelVideoTracks(data, fallbackArtist) {
   const tracks = [], seenIds = new Set();
   const pushVideo = (videoId, title, durText, thumbs) => {
@@ -536,7 +569,6 @@ function parseArtistItemBroad(item) {
   if (!name) return null;
   return { id, name, artworkURL: bestThumbnail(r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []) };
 }
-
 function parsePlaylistItem(item) {
   const r2 = item?.musicTwoRowItemRenderer;
   if (r2) {
@@ -655,7 +687,6 @@ async function handleSearch(query, env, userToken, mode) {
 
   return { tracks, albums, artists, playlists };
 }
-
 async function fetchPlayerData(trackId, env, userToken) {
   const visitorData = await getVisitorData(env, userToken);
   const baseBody = { context: { client: buildIosContext(visitorData) }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
@@ -696,10 +727,13 @@ async function fetchPlayerDataAndroid(trackId, env, userToken) {
 // group. No thirdParty embed context — this is the plain "TV app" identity.
 async function fetchPlayerDataTV(trackId, env, userToken) {
   const visitorData = await getVisitorData(env, userToken);
+  const cookie = env?.YT_COOKIE || '';
   const baseBody = { context: { client: { ...TVHTML5_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
+  const headers = { 'Content-Type': 'application/json', 'User-Agent': TVHTML5_UA };
+  if (cookie) headers['Cookie'] = cookie;
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': TVHTML5_UA },
+    headers,
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} TV player HTTP ${resp.status}`);
@@ -713,10 +747,13 @@ async function fetchPlayerDataTV(trackId, env, userToken) {
 // that reject the plain TV client (e.g. some age/region-gated content).
 async function fetchPlayerDataTVEmbedded(trackId, env, userToken) {
   const visitorData = await getVisitorData(env, userToken);
+  const cookie = env?.YT_COOKIE || '';
   const baseBody = { context: { client: { ...TV_EMBEDDED_CLIENT, visitorData }, thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
+  const headers = { 'Content-Type': 'application/json', 'User-Agent': TVHTML5_UA };
+  if (cookie) headers['Cookie'] = cookie;
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': TVHTML5_UA },
+    headers,
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} TVEmbedded player HTTP ${resp.status}`);
@@ -774,7 +811,6 @@ async function fetchPlayerDataAndroidNative(trackId, env, userToken) {
   if (data?.playabilityStatus?.status !== 'OK') throw new Error(`${LOG_PREFIX} AndroidNative blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
   return data;
 }
-
 async function fetchPlayerDataWebEmbedded(trackId, env, userToken) {
   const visitorData = await getVisitorData(env, userToken);
   const baseBody = { context: { client: { ...WEB_EMBEDDED_CLIENT, visitorData }, thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
@@ -856,7 +892,6 @@ async function resolveTVEmbedded(trackId, env, userToken) {
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
 }
-
 // ── Video support (ADDITIVE ONLY — eclipsemusic.app/docs "Video Playback") ──
 // This never touches the audio url/format decided above. It's a completely
 // separate, best-effort lookup for a muxed (video+audio in one file) source,
@@ -951,19 +986,24 @@ async function resolveAndroidVR(trackId, env, userToken) {
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
 }
-
 // ── FIX: Sequential stream resolution instead of parallel ──────────────
 // Previously: Promise.allSettled fired all 6 resolvers at once, YouTube saw
 // 6 simultaneous player API calls from the same IP and blocked them all as
 // "Sign in to confirm you're not a bot". Now: try one at a time, return on
 // first success. Best case = 1 API call, worst case = 6 (but sequential).
 async function handleStream(trackId, env, userToken) {
-  // NEW (2.9.8): AndroidMusic, TV, and TVEmbedded added to the fallback
-  // chain — 9 clients total spanning 4 distinct fingerprint families
-  // (Android app, iOS app, mobile/desktop web, TV surface) instead of 6
-  // spanning 3. More clients means more chances at a non-blocked response,
-  // but a worst-case burst is now 9 calls instead of 6 — the inter-attempt
-  // delay below matters more with this list, not less.
+  // Always try all 9 clients (2.9.10 reverted a PO-gated skip after
+  // production logs showed AndroidNative resolving fine with zero bot
+  // errors even without a PO token — see changelog above).
+  //
+  // One inline PO-token refresh attempt still happens first if a generator
+  // URL is configured and nothing is cached — this only affects what gets
+  // attached to each request via withPoToken(), never which/how many
+  // clients get tried.
+  if (!(await getPoToken(env)) && env?.YT_PO_TOKEN_GENERATOR_URL) {
+    await tryRefreshPoToken(env);
+  }
+
   const resolvers = [
     { name: 'AndroidNative', run: () => resolveAndroidNative(trackId, env, userToken) },
     { name: 'AndroidMusic', run: () => resolveAndroidMusic(trackId, env, userToken) },
@@ -1077,7 +1117,6 @@ async function handleAlbum(albumId, env, userToken) {
   tracks.forEach((t, i) => { t.album = albumTitle; t.trackNumber = i + 1; if (!t.artworkURL) t.artworkURL = artworkURL; });
   return { id: albumId, title: albumTitle, artist: albumArtist, artworkURL, trackCount: tracks.length, tracks };
 }
-
 async function handleArtist(artistId, env, userToken, mode) {
   const data = await ytmBrowse(artistId, env, userToken);
   const hdr = data?.header?.musicImmersiveHeaderRenderer || data?.header?.musicVisualHeaderRenderer || {};
@@ -1183,7 +1222,6 @@ function parseTokenPath(p) {
   return m2 ? { token: m2[1], mode: 'both', rest: m2[2] || '/' } : null;
 }
 function lastSegment(rest) { return rest.split('/').filter(Boolean).pop() || ''; }
-
 function buildManifest(mode) {
   const m = mode || 'both';
   const variants = {
@@ -1193,7 +1231,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.8', description: v.description,
+    id: v.id, name: v.name, version: '2.9.11', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
@@ -1341,7 +1379,6 @@ function buildSpineSource(origin) {
     ],
   };
 }
-
 async function handleRoute(rest, url, request, env, userToken, mode) {
   const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
   // Settings capability: Eclipse appends declared setting keys as query params
@@ -1394,7 +1431,6 @@ function jsonRes(data, status) {
   });
 }
 function htmlRes(b) { return new Response(b, { headers: { 'content-type': 'text/html; charset=utf-8' } }); }
-
 function buildPage() {
   return `<!DOCTYPE html>
 <html lang="en">
