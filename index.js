@@ -97,6 +97,12 @@ const YTM_API_KEY_FALLBACK = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
 function getApiKey(env) { return env?.YTM_API_KEY || YTM_API_KEY_FALLBACK; }
 
 const VISITOR_TTL_SEC = 300;
+const ECLIPSE_ADDON_IDS = new Set([
+  "com.ricky.youtube-music",
+  "com.ricky.youtube-music-songs",
+  "com.ricky.youtube-music-videos",
+]);
+const ECLIPSE_ACCESS_PUBLIC_KEY_B64 = "nYyISFMpuzTWY+3qx2Ya4D+V7Yh/IJHyyPwUSdGInOQ=";
 
 const WEB_REMIX_CONTEXT = { clientName: 'WEB_REMIX', clientVersion: '1.20260304.03.00', hl: 'en', gl: 'US' };
 const IOS_CLIENT_BASE = { clientName: 'IOS', clientVersion: '20.12.4', deviceMake: 'Apple', deviceModel: 'iPhone17,3', osName: 'iPhone', osVersion: '18.4.1.22E252', hl: 'en' };
@@ -1379,6 +1385,60 @@ function buildSpineSource(origin) {
     ],
   };
 }
+let cachedEclipsePublicKey = null;
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+function b64urlToBytes(b64url) {
+  let s = b64url.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return b64ToBytes(s);
+}
+async function getEclipsePublicKey() {
+  if (cachedEclipsePublicKey) return cachedEclipsePublicKey;
+  cachedEclipsePublicKey = await crypto.subtle.importKey(
+    "raw",
+    b64ToBytes(ECLIPSE_ACCESS_PUBLIC_KEY_B64),
+    { name: "Ed25519" },
+    false,
+    ["verify"]
+  );
+  return cachedEclipsePublicKey;
+}
+async function checkEclipseAccess(request) {
+  try {
+    const header = request.headers.get("x-eclipse-access");
+    if (!header) return null;
+    const parts = header.split(".");
+    if (parts.length !== 3 || parts[0] !== "ea1") return null;
+    const [prefix, body, sig] = parts;
+
+    const pubKey = await getEclipsePublicKey();
+    const valid = await crypto.subtle.verify(
+      "Ed25519",
+      pubKey,
+      b64urlToBytes(sig),
+      new TextEncoder().encode(`${prefix}.${body}`)
+    );
+    if (!valid) return null;
+
+    const claims = JSON.parse(new TextDecoder().decode(b64urlToBytes(body)));
+    if (!claims || !ECLIPSE_ADDON_IDS.has(claims.aud)) return null;
+
+    const now = Math.floor(Date.now() / 1000);
+    if (typeof claims.exp !== "number" || claims.exp < now - 60) return null;
+
+    return claims;
+  } catch (e) {
+    return null;
+  }
+}
+function eclipseAccessDeniedResponse() {
+  return jsonRes({ error: "Unavailable" }, 403);
+}
 async function handleRoute(rest, url, request, env, userToken, mode) {
   const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
   // Settings capability: Eclipse appends declared setting keys as query params
@@ -1409,6 +1469,11 @@ async function handleRoute(rest, url, request, env, userToken, mode) {
     });
   }
   if (rest === '/manifest.json' || rest === '/manifest') return jsonRes(buildManifest(mode));
+  const ECLIPSE_GATED_PREFIXES = ["search", "stream", "download", "album", "artist", "playlist"];
+if (ECLIPSE_GATED_PREFIXES.some((p) => rest === p || rest.startsWith(p))) {
+  const eclipseClaims = await checkEclipseAccess(request);
+  if (!eclipseClaims) return eclipseAccessDeniedResponse();
+}
   if (rest === '/search') return jsonRes(await handleSearch(q, env, userToken, effectiveMode));
   if (rest.startsWith('/stream/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleStream(id, env, userToken)); }
   if (rest.startsWith('/download/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return await proxyDownload(id, request, env, userToken); }
