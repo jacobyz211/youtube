@@ -1469,8 +1469,8 @@ async function handleRoute(rest, url, request, env, userToken, mode) {
     });
   }
   if (rest === '/manifest.json' || rest === '/manifest') return jsonRes(buildManifest(mode));
-  const ECLIPSE_GATED_PREFIXES = ["search", "stream", "download", "album", "artist", "playlist"];
-if (ECLIPSE_GATED_PREFIXES.some((p) => rest === p || rest.startsWith(p))) {
+  const ECLIPSE_GATED_PREFIXES = ["/search", "/stream", "/download", "/album", "/artist", "/playlist"];
+if (ECLIPSE_GATED_PREFIXES.some((p) => rest === p || rest.startsWith(p + "/"))) {
   const eclipseClaims = await checkEclipseAccess(request);
   if (!eclipseClaims) return eclipseAccessDeniedResponse();
 }
