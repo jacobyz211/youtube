@@ -271,14 +271,23 @@ function rankAudio(formats) {
 // A "limited" URL answers the first ~1 MiB and then 403s, which is what made
 // tracks stall. Asking for the last single byte is the cheap way to find out:
 // a real URL answers 206, a limited one answers 403.
+//
+// Only a 401/403/410 counts as limited. googlevideo redirects (302) some range
+// requests to another backend, and treating that as a failure threw away good
+// URLs; a network blip is likewise not proof that the URL is limited, and the
+// chunk loop re-mints on a real 403 anyway.
 async function servesWholeFile(url, ua, total) {
   if (!total || total < 1) return true;
   try {
-    const res = await request(url, { headers: { range: `bytes=${total - 1}-${total - 1}`, 'user-agent': ua } });
+    const res = await request(url, {
+      headers: { range: `bytes=${total - 1}-${total - 1}`, 'user-agent': ua },
+      follow: 2,
+      timeout: 10000,
+    });
     res.stream.resume();
-    return res.status === 200 || res.status === 206;
+    return ![401, 403, 410].includes(res.status);
   } catch {
-    return false;
+    return true;
   }
 }
 
@@ -328,42 +337,57 @@ async function resolve(videoId) {
   if (cached) return cached;
 
   const errors = [];
-  for (const client of CLIENTS) {
-    try {
-      const sd = await player(client, videoId);
-      const audio = rankAudio(sd.adaptiveFormats || [])[0];
-      if (!audio) throw new Error('no audio format');
-      const total = Number(audio.contentLength) || null;
 
-      if (!(await servesWholeFile(audio.url, client.ua, total))) {
-        errors.push(`${client.name} limited url`);
-        console.log(new Date().toISOString(), 'limited url', videoId, client.name);
-        continue;
+  // YouTube withdraws into handing out "limited" URLs when one address asks for
+  // a lot of tracks quickly. It is not sticky: the next round usually returns a
+  // whole-file URL, so a round of failures is worth one more try before giving
+  // up on the track.
+  for (let round = 0; round < 3; round++) {
+    if (round > 0) await sleep(300 * round);
+
+    let sawLimited = false;
+    for (const client of CLIENTS) {
+      try {
+        const sd = await player(client, videoId);
+        const audio = rankAudio(sd.adaptiveFormats || [])[0];
+        if (!audio) throw new Error('no audio format');
+        const total = Number(audio.contentLength) || null;
+
+        if (!(await servesWholeFile(audio.url, client.ua, total))) {
+          errors.push(`${client.name} limited url`);
+          sawLimited = true;
+          console.log(new Date().toISOString(), 'limited url', videoId, client.name, round);
+          continue;
+        }
+
+        // Progressive video is only used by the optional /video route; the addon
+        // itself only ever asks for audio.
+        const video = (sd.formats || [])
+          .filter((f) => f.url && String(f.mimeType || '').startsWith('video/mp4'))
+          .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+
+        const val = {
+          audio: audio.url,
+          video: video ? video.url : null,
+          ua: client.ua,
+          total,
+          client: client.name,
+        };
+        memoSet(videoId, val);
+        console.log(new Date().toISOString(), client.name, 'resolved', videoId, total || '');
+        return val;
+      } catch (e) {
+        errors.push(e.message);
+        console.log(new Date().toISOString(), 'resolve failed', videoId, e.message);
+        // A challenged client usually means the session token has gone stale, so
+        // make the next attempt fetch a fresh one.
+        if (e.message.includes('LOGIN_REQUIRED')) visitorData = '';
       }
-
-      // Progressive video is only used by the optional /video route; the addon
-      // itself only ever asks for audio.
-      const video = (sd.formats || [])
-        .filter((f) => f.url && String(f.mimeType || '').startsWith('video/mp4'))
-        .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-
-      const val = {
-        audio: audio.url,
-        video: video ? video.url : null,
-        ua: client.ua,
-        total,
-        client: client.name,
-      };
-      memoSet(videoId, val);
-      console.log(new Date().toISOString(), client.name, 'resolved', videoId, total || '');
-      return val;
-    } catch (e) {
-      errors.push(e.message);
-      console.log(new Date().toISOString(), 'resolve failed', videoId, e.message);
-      // A challenged client usually means the session token has gone stale, so
-      // make the next attempt fetch a fresh one.
-      if (e.message.includes('LOGIN_REQUIRED')) visitorData = '';
     }
+
+    // Nothing was throttled, so the track really is unplayable and another round
+    // would only cost more player calls.
+    if (!sawLimited) break;
   }
 
   // Every client saying the video is unavailable means it is gone, not that we
