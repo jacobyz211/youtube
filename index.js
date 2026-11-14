@@ -1,102 +1,41 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.11 (real PO token generator support)
-// Changes from 2.9.10:
-//   - FIX: tryRefreshPoToken() sent a bare GET to YT_PO_TOKEN_GENERATOR_URL.
-//     Real BotGuard-attestation PO token generators — e.g. bgutil-ytdlp-pot-
-//     provider (github.com/Brainicism/bgutil-ytdlp-pot-provider), the same
-//     LuanRT BgUtils-based approach clients like Metrolist use internally —
-//     expose POST /get_pot with a JSON body, not GET. Fixed to POST an empty
-//     JSON body; the response fields (po_token, visitor_data) already
-//     matched what this function expected, so no other changes were needed.
-//   - This addon's PO-token plumbing (env var, Upstash caching, withPoToken)
-//     was already correct — it just never had a real generator wired up
-//     behind it. Deploy bgutil-ytdlp-pot-provider (Docker image works on
-//     Render/Fly/any host with a persistent process — NOT Cloudflare
-//     Workers, which can't run its BotGuard interpreter) and point
-//     YT_PO_TOKEN_GENERATOR_URL at its /get_pot endpoint to actually use
-//     this path instead of running with zero attestation.
-// Changes from 2.9.9 (REVERTED in 2.9.10):
-//   - 2.9.9 had skipped clients believed to need a PO token when none was
-//     cached. Production logs showed AndroidNative resolving on the FIRST
-//     attempt with zero bot errors even with no PO token configured — that
-//     shortcut removed the most reliable client, so 2.9.10 reverted it.
-//     handleStream always tries all 9 clients again, same order as 2.9.8.
-// Changes from 2.9.8:
-//   - env.YT_COOKIE is now sent on the TV and TVEmbedded player calls
-//     (previously the only two resolvers missing it).
-// Changes from 2.9.7:
-//   - Added 3 more InnerTube clients to the /stream fallback chain:
-//     AndroidMusic (the YT Music app's own client — was already implemented
-//     for /download but never tried for streaming), TVHTML5 ("tv" in
-//     yt-dlp's current default client list), and
-//     TVHTML5_SIMPLY_EMBEDDED_PLAYER ("tv_embedded", paired with a
-//     thirdParty embedUrl like WebEmbedded). Chain is now 9 clients across
-//     4 fingerprint families (Android app, iOS app, web, TV surface)
-//     instead of 6 across 3 — TV-surface clients are a fundamentally
-//     different fingerprint from mobile/web, useful when those two families
-//     get flagged together.
-// Changes from 2.9.6:
-//   - FIX: AndroidNative/WebEmbedded/MWEB/WebCreator/AndroidVR player calls
-//     previously sent NO visitorData at all in context.client — a request
-//     claiming to be a real app client but with zero visitor identity is a
-//     strong bot signal under YouTube's tightened 2026 enforcement (which now
-//     also scrutinizes ANDROID/iOS, not just WEB). Every player-data
-//     resolver now attaches a real visitorData via getVisitorData() before
-//     the PO token gets layered on.
-//   - FIX: withPoToken() used to overwrite context.client.visitorData with a
-//     SEPARATELY cached "ytm:po_visitor_data" value that had nothing to do
-//     with the visitorData already on the request — a mismatched
-//     PO-token/visitorData pairing looks like tampering to BotGuard. It now
-//     only attaches the PO token itself and leaves visitorData alone.
-//   - Added a small randomized delay (150-400ms) between fallback resolver
-//     attempts in handleStream — back-to-back player calls with zero
-//     spacing from the same Workers IP is a machine-pattern signal on its
-//     own, independent of which client each call claims to be. No delay is
-//     added before the first attempt.
-//   - Added a diagnostic log line when no PO token is cached, so a dead
-//     PO-token generator shows up immediately in `wrangler tail` instead of
-//     silently degrading every request.
-// Changes from 2.9.5:
-//   - FIX: logs showed the iOS HLS call getting bot-blocked ("Sign in to
-//     confirm you're not a bot") on EVERY /stream request once it was moved
-//     to run first — that's an extra iOS API call per track, which is
-//     exactly what triggers YouTube's bot detection. Reverted the order:
-//     AndroidNative/WebEmbedded progressive (>=240p) are tried first since
-//     AndroidNative already ran for audio anyway, and iOS HLS is now only a
-//     last resort for tracks where neither progressive source has anything.
-//   - Added a success log line when a video actually attaches, so future
-//     `wrangler tail` output shows which source won instead of only failures.
-// Changes from 2.9.4:
-//   - FIX: the AndroidNative/WebEmbedded "progressive" mp4 formats are often
-//     ONLY available as legacy itag 17 (144p 3GP, ~100kbps, odd aspect ratio)
-//     — that's what was showing up as a tiny squished/cropped video in
-//     Eclipse. pickVideoRenditions requires height >= 240 to reject that
-//     legacy format.
-// Changes from 2.9.3:
-//   - video lookup tries multiple clients (AndroidNative progressive mp4,
-//     then WebEmbedded progressive mp4, then falls back to the iOS HLS
-//     manifest as a muxed source) instead of only AndroidNative — YouTube
-//     frequently omits progressive mp4 for a given client/video, so relying
-//     on just one source meant the `video` field was almost never present.
-// Changes from 2.9.2:
-//   - ADDITIVE ONLY: /stream now also attaches a `video` object (per
-//     eclipsemusic.app/docs "Video Playback") when a muxed rendition
-//     exists. The existing audio url/format resolution logic is UNCHANGED.
-//   - New addon Settings capability (searchMode, videoQuality) so users can
-//     pick Songs/Videos/Both and preferred video quality from Eclipse's
-//     settings cog, instead of needing separate installs.
-// Changes from 2.9.1:
-//   - handleStream: sequential instead of parallel (stops triggering YouTube bot detection)
-//   - fetchPlayerData: stop deleting visitor data on bot blocks (keeps cache valid)
-//   - handleSearch: backfill only for empty categories, keeps all 6 search types
-//   - 8SPINE module support (async-free module code)
-
+// author: ricky | version: 2.10.0 — dead-client purge + stream URL cache
+//
+// WHAT CHANGED IN 2.10.0 (and why the "10 bot errors per stream" are gone)
+// - The /stream chain is now 3 clients, not 9. Live probing showed that 7 of
+//   the 10 client identities this addon was trying no longer return streaming
+//   data at ALL — they fail with dead-client errors, not bot checks:
+//     WEB / WEB_REMIX / MWEB / TVHTML5  -> UNPLAYABLE "The page needs to be reloaded."
+//     TVHTML5_SIMPLY_EMBEDDED_PLAYER    -> ERROR "YouTube is no longer supported in this application or device."
+//     WEB_EMBEDDED_PLAYER               -> ERROR "This video is unavailable"
+//     WEB_CREATOR / ANDROID_MUSIC       -> LOGIN_REQUIRED "Please sign in"
+//   Those attempts were the ~10 error lines per stream in `wrangler tail`:
+//   one genuine failure fanned out into 8 more player calls, plus 3 more from
+//   the old fetchVideoInfo() best-effort video probe.
+// - Resolved stream URLs are cached (Upstash + per-isolate memory) until the
+//   URL's own expire= timestamp. Replaying a track now costs ZERO player
+//   calls. This is the main reason other YTM frontends feel instant.
+// - Video is derived from the same player response that resolved the audio,
+//   so the extra player calls fetchVideoInfo() used to make are gone.
+// - A client that answers with a bot check is skipped for 2 minutes instead of
+//   being hammered again on the next stream request.
+// - PO-token plumbing removed. YouTube binds PO tokens to a single video ID and
+//   only WEB/WEB_EMBEDDED read serviceIntegrityDimensions.poToken, so the old
+//   global 6-hour token attached to every Android/iOS call could never be
+//   valid — and a stale token on a mismatched client is itself a tamper signal.
+//   None of the three working clients consume a PO token.
+// - visitorData cache TTL 5 min -> 6 h (less artificial churn).
+//
+// History (2.9.x): repeated attempts to cure LOGIN_REQUIRED by adding more
+// client identities. That cannot work when the identities themselves are dead.
+// The chain now contains only clients verified to resolve.
 const LOG_PREFIX = '[YTMusic]';
+
 const YTM_BASE = 'https://music.youtube.com';
 const YTM_API_KEY_FALLBACK = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
 function getApiKey(env) { return env?.YTM_API_KEY || YTM_API_KEY_FALLBACK; }
 
-const VISITOR_TTL_SEC = 300;
+const VISITOR_TTL_SEC = 21600;
 const ECLIPSE_ADDON_IDS = new Set([
   "com.ricky.youtube-music",
   "com.ricky.youtube-music-songs",
@@ -111,20 +50,12 @@ const ANDROID_VR_CLIENT = { clientName: 'ANDROID_VR', clientVersion: '1.61.48', 
 const ANDROID_VR_UA = 'com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 14; en_US) gzip';
 const ANDROID_NATIVE_CLIENT = { clientName: 'ANDROID', clientVersion: '20.22.36', androidSdkVersion: 35, osName: 'Android', osVersion: '15', hl: 'en', gl: 'US' };
 const ANDROID_NATIVE_UA = 'com.google.android.youtube/20.22.36 (Linux; U; Android 15)';
-const MWEB_CLIENT = { clientName: 'MWEB', clientVersion: '2.20260810.01.00', hl: 'en', gl: 'US' };
-const MWEB_UA = 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36';
-const WEB_CREATOR_CLIENT = { clientName: 'WEB_CREATOR', clientVersion: '1.20260530.01.00', clientScreen: 'EMBED', hl: 'en', gl: 'US' };
-const WEB_EMBEDDED_CLIENT = { clientName: 'WEB_EMBEDDED_PLAYER', clientVersion: '2.20260530.01.00', hl: 'en', gl: 'US' };
-// NEW (2.9.8): additional InnerTube clients for the /stream fallback chain.
-// TVHTML5 ("tv") and TVHTML5_SIMPLY_EMBEDDED_PLAYER ("tv_embedded") are two
-// of yt-dlp's current default extraction clients alongside android/ios/mweb
-// — TV-surface clients are a different fingerprint family from mobile/web
-// entirely, which is useful when mobile+web clients are all getting flagged
-// together. TV_EMBEDDED additionally carries a thirdParty.embedUrl like
-// WebEmbedded, which sometimes recovers videos the plain TV client can't.
-const TVHTML5_CLIENT = { clientName: 'TVHTML5', clientVersion: '7.20260815.16.00', hl: 'en', gl: 'US' };
-const TVHTML5_UA = 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.5) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/2.2 TV Safari/537.36';
-const TV_EMBEDDED_CLIENT = { clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0', hl: 'en', gl: 'US' };
+// The WEB / MWEB / WEB_CREATOR / WEB_EMBEDDED_PLAYER / TVHTML5 /
+// TVHTML5_SIMPLY_EMBEDDED_PLAYER client definitions that used to live here were
+// removed in 2.10.0: they are dead identities that can never resolve, and every
+// call spent on them is one more flagged request from this Worker's IP.
+// ANDROID_MUSIC_CLIENT stays — it is dead for /player but still valid for
+// /search and /browse, which is what the search backfill uses it for.
 
 const SEARCH_PARAMS = {
   songs: 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
@@ -144,50 +75,10 @@ const SEARCH_HEADERS = {
 const ANDROID_MUSIC_UA = 'com.google.android.apps.youtube.music/7.27.0 (Linux; U; Android 14; en_US) gzip';
 const IOS_UA = 'com.google.ios.youtube/20.12.4 (iPhone17,3; U; CPU iOS 18_4_1 like Mac OS X)';
 
-async function getPoToken(env) {
-  const cached = await upstashCmd(env, 'GET', 'ytm:po_token');
-  if (cached && typeof cached === 'string' && cached.length > 4) return cached;
-  return env?.YT_PO_TOKEN || null;
-}
-async function getPoVisitorData(env) {
-  const cached = await upstashCmd(env, 'GET', 'ytm:po_visitor_data');
-  if (cached && typeof cached === 'string' && cached.length > 4) return cached;
-  return env?.YT_VISITOR_DATA || null;
-}
-async function withPoToken(body, env) {
-  const poToken = await getPoToken(env);
-  if (!poToken) return body;
-  return { ...body, serviceIntegrityDimensions: { poToken } };
-}
-async function tryRefreshPoToken(env) {
-  const generatorUrl = env?.YT_PO_TOKEN_GENERATOR_URL;
-  if (!generatorUrl) return;
-  try {
-    // FIX (2.9.11): a real PO-token generator like bgutil-ytdlp-pot-provider
-    // (github.com/Brainicism/bgutil-ytdlp-pot-provider) — the same LuanRT
-    // BotGuard-attestation approach Metrolist and yt-dlp itself rely on —
-    // exposes POST /get_pot, not a bare GET. An empty JSON body is enough to
-    // get a session-scoped token; its response fields (po_token,
-    // visitor_data) already match what this function reads below.
-    const res = await fetch(generatorUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-      cf: { cacheTtl: 0 },
-    });
-    if (!res.ok) return;
-    const { po_token, visitor_data } = await res.json();
-    if (po_token) {
-      await upstashCmd(env, 'SET', 'ytm:po_token', po_token, 'EX', 21600);
-      console.log(LOG_PREFIX, 'PO token refreshed from generator');
-    }
-    if (visitor_data) {
-      await upstashCmd(env, 'SET', 'ytm:po_visitor_data', visitor_data, 'EX', 21600);
-    }
-  } catch (e) {
-    console.log(LOG_PREFIX, 'PO token auto-refresh failed:', e.message);
-  }
-}
+// PO-token helpers were removed in 2.10.0. See the header note: tokens are
+// bound to a single video ID and only the WEB-family clients read them, and all
+// of those clients are dead. YT_PO_TOKEN / YT_VISITOR_DATA /
+// YT_PO_TOKEN_GENERATOR_URL are no longer read.
 async function upstashCmd(env, ...args) {
   const url = env?.UPSTASH_REDIS_REST_URL, token = env?.UPSTASH_REDIS_REST_TOKEN;
   if (!url || !token) return null;
@@ -693,160 +584,99 @@ async function handleSearch(query, env, userToken, mode) {
 
   return { tracks, albums, artists, playlists };
 }
-async function fetchPlayerData(trackId, env, userToken) {
+// ═══════════════════════════════════════════════════════════════════════
+// ── PLAYER & STREAMING ─────────────────────────────────────────────────
+// Three client identities are tried, in this order, and only these three:
+//   android   -> the YT Music / YT app identity: direct AAC (itag 140) plus a
+//                progressive mp4 for the optional video field.
+//   androidvr -> Quest headset identity: a genuinely different fingerprint
+//                family, used when the Android identity gets checked.
+//   ios       -> HLS manifest (works even when progressive formats are absent).
+// Measured 2026-11-13: all three return status=OK with no visitorData, no
+// cookie and no PO token. The other seven identities in the old chain returned
+// UNPLAYABLE / ERROR / LOGIN_REQUIRED unconditionally.
+// ═══════════════════════════════════════════════════════════════════════
+class PlayerError extends Error {
+  constructor(message, botBlocked) {
+    super(message);
+    this.name = 'PlayerError';
+    this.botBlocked = !!botBlocked;
+  }
+}
+
+const PLAYER_CLIENTS = {
+  android: {
+    label: 'ANDROID',
+    client: () => ANDROID_NATIVE_CLIENT,
+    ua: ANDROID_NATIVE_UA,
+    headers: { 'X-Goog-Api-Format-Version': '2' },
+  },
+  androidvr: {
+    label: 'ANDROID_VR',
+    client: () => ANDROID_VR_CLIENT,
+    ua: ANDROID_VR_UA,
+    headers: { 'X-Goog-Api-Format-Version': '2' },
+  },
+  ios: {
+    label: 'IOS',
+    client: () => IOS_CLIENT_BASE,
+    ua: IOS_UA,
+    headers: {},
+  },
+};
+
+// One player request, parameterised by client. Replaces the nine near-identical
+// fetchPlayerData* functions the addon used to carry.
+async function playerRequest(kind, trackId, env, userToken) {
+  const spec = PLAYER_CLIENTS[kind];
+  if (!spec) throw new Error(`unknown player client ${kind}`);
   const visitorData = await getVisitorData(env, userToken);
-  const baseBody = { context: { client: buildIosContext(visitorData) }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
-  const resp = await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`, {
+  const client = {};
+  for (const [k, v] of Object.entries(spec.client())) client[k] = v;
+  if (visitorData) client.visitorData = visitorData;
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'User-Agent': spec.ua,
+    ...spec.headers,
+  };
+  if (env?.YT_COOKIE) headers.Cookie = env.YT_COOKIE;
+
+  const body = { context: { client }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
+  const resp = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': IOS_UA },
-    body: JSON.stringify(await withPoToken(baseBody, env)),
+    headers,
+    body: JSON.stringify(body),
   });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} Player HTTP ${resp.status}`);
+  if (!resp.ok) {
+    throw new PlayerError(`${spec.label} HTTP ${resp.status}`, resp.status === 403 || resp.status === 429);
+  }
   const data = await resp.json();
-  if (data?.playabilityStatus?.status !== 'OK') {
-    const reason = data?.playabilityStatus?.reason || '';
-    const status = data?.playabilityStatus?.status || '';
-    // FIX: do NOT delete visitor data on bot blocks — the cache is still valid,
-    // deleting it just forces a slow fresh fetch on the next request
-    throw new Error(`${LOG_PREFIX} iOS blocked: ${reason || status || 'unknown'}`);
+  const ps = data?.playabilityStatus || {};
+  if (ps.status !== 'OK') {
+    const detail = `${ps.status || 'UNKNOWN'}${ps.reason ? ': ' + ps.reason : ''}`;
+    // Only anti-bot / auth refusals cool the client down. A deleted or
+    // region-locked video ("This video is unavailable") is a property of that
+    // video, not of the client, and must not park the client for other tracks.
+    const botBlocked = /bot|sign in|rate limit|too many/i.test(ps.reason || '') ||
+      (ps.status === 'LOGIN_REQUIRED' && !ps.reason);
+    throw new PlayerError(`${spec.label} ${detail}`, botBlocked);
   }
   return data;
 }
 
-async function fetchPlayerDataAndroid(trackId, env, userToken) {
-  const cookie = env?.YT_COOKIE || '';
-  const visitorData = await getVisitorData(env, userToken);
-  const baseBody = { context: { client: { ...ANDROID_MUSIC_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
-  const headers = { 'Content-Type': 'application/json', 'User-Agent': ANDROID_MUSIC_UA, 'X-Goog-Api-Format-Version': '2' };
-  if (cookie) headers['Cookie'] = cookie;
-  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
-    method: 'POST', headers, body: JSON.stringify(await withPoToken(baseBody, env)),
-  });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} Android player HTTP ${resp.status}`);
-  const data = await resp.json();
-  if (data?.playabilityStatus?.status !== 'OK') throw new Error(`${LOG_PREFIX} Android blocked: ${data?.playabilityStatus?.reason || 'unknown'}`);
-  return data;
+// A client that just answered with a bot check is parked for two minutes.
+// Retrying it on the very next request is what turns one block into a storm.
+const CLIENT_COOLDOWN_MS = 120000;
+const blockedClients = new Map();
+function clientCoolingDown(label) {
+  const until = blockedClients.get(label);
+  if (!until) return false;
+  if (Date.now() >= until) { blockedClients.delete(label); return false; }
+  return true;
 }
-
-// NEW (2.9.8): TVHTML5 — a fully different fingerprint family (TV surface,
-// not mobile/web), useful when mobile+web clients are getting flagged as a
-// group. No thirdParty embed context — this is the plain "TV app" identity.
-async function fetchPlayerDataTV(trackId, env, userToken) {
-  const visitorData = await getVisitorData(env, userToken);
-  const cookie = env?.YT_COOKIE || '';
-  const baseBody = { context: { client: { ...TVHTML5_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
-  const headers = { 'Content-Type': 'application/json', 'User-Agent': TVHTML5_UA };
-  if (cookie) headers['Cookie'] = cookie;
-  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(await withPoToken(baseBody, env)),
-  });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} TV player HTTP ${resp.status}`);
-  const data = await resp.json();
-  if (data?.playabilityStatus?.status !== 'OK') throw new Error(`${LOG_PREFIX} TV blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
-  return data;
-}
-
-// NEW (2.9.8): TVHTML5_SIMPLY_EMBEDDED_PLAYER — the TV-embed variant, paired
-// with a thirdParty.embedUrl like WebEmbedded. Historically recovers videos
-// that reject the plain TV client (e.g. some age/region-gated content).
-async function fetchPlayerDataTVEmbedded(trackId, env, userToken) {
-  const visitorData = await getVisitorData(env, userToken);
-  const cookie = env?.YT_COOKIE || '';
-  const baseBody = { context: { client: { ...TV_EMBEDDED_CLIENT, visitorData }, thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
-  const headers = { 'Content-Type': 'application/json', 'User-Agent': TVHTML5_UA };
-  if (cookie) headers['Cookie'] = cookie;
-  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(await withPoToken(baseBody, env)),
-  });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} TVEmbedded player HTTP ${resp.status}`);
-  const data = await resp.json();
-  if (data?.playabilityStatus?.status !== 'OK') throw new Error(`${LOG_PREFIX} TVEmbedded blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
-  return data;
-}
-
-async function fetchPlayerDataMWeb(trackId, env, userToken) {
-  const visitorData = await getVisitorData(env, userToken);
-  const baseBody = { context: { client: { ...MWEB_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
-  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json', 'User-Agent': MWEB_UA,
-      'Origin': 'https://m.youtube.com', 'Referer': 'https://m.youtube.com/',
-      'X-Youtube-Client-Name': '2', 'X-Youtube-Client-Version': MWEB_CLIENT.clientVersion,
-    },
-    body: JSON.stringify(await withPoToken(baseBody, env)),
-  });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} MWEB player HTTP ${resp.status}`);
-  const data = await resp.json();
-  if (data?.playabilityStatus?.status !== 'OK') throw new Error(`${LOG_PREFIX} MWEB blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
-  return data;
-}
-
-async function fetchPlayerDataWebCreator(trackId, env, userToken) {
-  const visitorData = await getVisitorData(env, userToken);
-  const baseBody = { context: { client: { ...WEB_CREATOR_CLIENT, visitorData }, thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
-  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-      'Origin': 'https://www.youtube.com', 'Referer': `https://www.youtube.com/embed/${trackId}`,
-    },
-    body: JSON.stringify(await withPoToken(baseBody, env)),
-  });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} WebCreator player HTTP ${resp.status}`);
-  const data = await resp.json();
-  if (data?.playabilityStatus?.status !== 'OK') throw new Error(`${LOG_PREFIX} WebCreator blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
-  return data;
-}
-
-async function fetchPlayerDataAndroidNative(trackId, env, userToken) {
-  const visitorData = await getVisitorData(env, userToken);
-  const baseBody = { context: { client: { ...ANDROID_NATIVE_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
-  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_NATIVE_UA, 'X-Goog-Api-Format-Version': '2' },
-    body: JSON.stringify(await withPoToken(baseBody, env)),
-  });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} AndroidNative player HTTP ${resp.status}`);
-  const data = await resp.json();
-  if (data?.playabilityStatus?.status !== 'OK') throw new Error(`${LOG_PREFIX} AndroidNative blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
-  return data;
-}
-async function fetchPlayerDataWebEmbedded(trackId, env, userToken) {
-  const visitorData = await getVisitorData(env, userToken);
-  const baseBody = { context: { client: { ...WEB_EMBEDDED_CLIENT, visitorData }, thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
-  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-      'Origin': 'https://www.youtube.com', 'Referer': `https://www.youtube.com/embed/${trackId}`,
-    },
-    body: JSON.stringify(await withPoToken(baseBody, env)),
-  });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} WebEmbedded player HTTP ${resp.status}`);
-  const data = await resp.json();
-  if (data?.playabilityStatus?.status !== 'OK') throw new Error(`${LOG_PREFIX} WebEmbedded blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
-  return data;
-}
-
-async function fetchPlayerDataAndroidVR(trackId, env, userToken) {
-  const visitorData = await getVisitorData(env, userToken);
-  const baseBody = { context: { client: { ...ANDROID_VR_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
-  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_VR_UA, 'X-Goog-Api-Format-Version': '2' },
-    body: JSON.stringify(await withPoToken(baseBody, env)),
-  });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} AndroidVR player HTTP ${resp.status}`);
-  const data = await resp.json();
-  if (data?.playabilityStatus?.status !== 'OK') throw new Error(`${LOG_PREFIX} AndroidVR blocked: ${data?.playabilityStatus?.reason || 'unknown'}`);
-  return data;
+function coolDownClient(label) {
+  blockedClients.set(label, Date.now() + CLIENT_COOLDOWN_MS);
 }
 
 function pickBestAudio(sd) {
@@ -854,71 +684,16 @@ function pickBestAudio(sd) {
     .filter(f => f.mimeType?.startsWith('audio/mp4') && f.url)
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
 }
-function pickProgressiveFormat(sd) {
-  const formats = sd?.formats || [];
-  const candidates = formats
-    .filter(f => f.url && f.mimeType && f.mimeType.startsWith('video/mp4') && f.mimeType.includes('mp4a'))
-    .sort((a, b) => (a.bitrate || 0) - (b.bitrate || 0));
-  return candidates[0] || null;
-}
 
-async function resolveAndroidNative(trackId, env, userToken) {
-  const data = await fetchPlayerDataAndroidNative(trackId, env, userToken);
-  const progressive = pickProgressiveFormat(data?.streamingData);
-  if (progressive?.url) return { url: progressive.url, format: 'mp4', quality: 'native' };
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
-  throw new Error('no usable format');
-}
-// NEW (2.9.8): the YouTube Music app's own client identity. It was already
-// implemented (fetchPlayerDataAndroid) and used for /download, but was never
-// tried during /stream — a natural gap to close since it's the exact client
-// a real YT Music session presents.
-async function resolveAndroidMusic(trackId, env, userToken) {
-  const data = await fetchPlayerDataAndroid(trackId, env, userToken);
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
-  throw new Error('no usable format');
-}
-// NEW (2.9.8): TVHTML5 — different fingerprint family (TV surface).
-async function resolveTV(trackId, env, userToken) {
-  const data = await fetchPlayerDataTV(trackId, env, userToken);
-  const hlsUrl = data?.streamingData?.hlsManifestUrl;
-  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
-  throw new Error('no usable format');
-}
-// NEW (2.9.8): TVHTML5_SIMPLY_EMBEDDED_PLAYER — TV-embed variant.
-async function resolveTVEmbedded(trackId, env, userToken) {
-  const data = await fetchPlayerDataTVEmbedded(trackId, env, userToken);
-  const hlsUrl = data?.streamingData?.hlsManifestUrl;
-  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
-  throw new Error('no usable format');
-}
-// ── Video support (ADDITIVE ONLY — eclipsemusic.app/docs "Video Playback") ──
-// This never touches the audio url/format decided above. It's a completely
-// separate, best-effort lookup for a muxed (video+audio in one file) source,
-// attached to the stream response as an extra `video` field.
-//
-// IMPORTANT: YouTube's "progressive" formats array is frequently limited to
-// legacy itag 17 (144p 3GP, ~100kbps, odd aspect ratio) — that's what showed
-// up as a tiny squished video. We reject anything under 240p.
-//
-// ORDER MATTERS: AndroidNative/WebEmbedded progressive are tried FIRST
-// because AndroidNative already ran once for audio — checking its result
-// again here costs nothing extra client-wise. The iOS HLS manifest is only
-// tried as a LAST resort: hitting it on every single track (as a previous
-// version did) adds one extra iOS API call per stream request, and that's
-// exactly the repeated-request pattern that gets iOS bot-blocked
-// ("Sign in to confirm you're not a bot") — confirmed in production logs.
+// ── Video support (eclipsemusic.app/docs "Video Playback") ──────────────
+// Built from the SAME player response that resolved the audio, so it costs no
+// extra requests. Legacy itag 17 (144p 3GP) is rejected — it is what showed up
+// as a tiny squished video.
 const MIN_VIDEO_HEIGHT = 240;
 function pickVideoRenditions(sd) {
-  const formats = sd?.formats || [];
-  return formats
-    .filter(f => f.url && f.mimeType && f.mimeType.startsWith('video/mp4') && f.mimeType.includes('mp4a') && (f.height || 0) >= MIN_VIDEO_HEIGHT)
+  return (sd?.formats || [])
+    .filter(f => f.url && f.mimeType?.startsWith('video/mp4') &&
+      f.mimeType.includes('mp4a') && (f.height || 0) >= MIN_VIDEO_HEIGHT)
     .map(f => ({ url: f.url, height: f.height, width: f.width || 0, mimeType: 'video/mp4' }))
     .sort((a, b) => b.height - a.height);
 }
@@ -928,139 +703,110 @@ function buildVideoInfo(sd) {
   const best = renditions[0];
   return { url: best.url, mimeType: 'video/mp4', muxed: true, width: best.width || 0, height: best.height, renditions };
 }
-async function fetchVideoInfo(trackId, env, userToken) {
-  // 1) AndroidNative progressive mp4 (>= 240p — rejects itag 17 junk)
+
+// ── Resolved-URL cache ──────────────────────────────────────────────────
+// Two tiers: an in-isolate Map (free) and Upstash (shared across isolates).
+// Entries expire on YouTube's own timestamp, so a cached URL is always one the
+// CDN still accepts — that is why replaying a track makes zero API calls.
+const STREAM_CACHE_L1 = new Map();
+const L1_MAX_ENTRIES = 500;
+
+function urlExpirySeconds(url) {
+  const m = /[?&]expire=(\d+)/.exec(url || '');
+  return m ? parseInt(m[1], 10) : Math.floor(Date.now() / 1000) + 3600;
+}
+async function getCachedStream(env, trackId) {
+  const now = Math.floor(Date.now() / 1000);
+  const mem = STREAM_CACHE_L1.get(trackId);
+  if (mem && mem.expiresAt > now + 60) return mem.result;
+  if (mem) STREAM_CACHE_L1.delete(trackId);
+  const raw = await upstashCmd(env, 'GET', `ytm:stream:${trackId}`);
+  if (!raw || typeof raw !== 'string') return null;
   try {
-    const data = await fetchPlayerDataAndroidNative(trackId, env, userToken);
-    const info = buildVideoInfo(data?.streamingData);
-    if (info) { console.log(LOG_PREFIX, `video attached via AndroidNative for ${trackId} (${info.height}p)`); return info; }
-  } catch (e) {
-    console.log(LOG_PREFIX, `video lookup (AndroidNative) failed for ${trackId} (non-fatal):`, e.message);
-  }
-  // 2) WebEmbedded progressive mp4 (same 240p floor)
-  try {
-    const data = await fetchPlayerDataWebEmbedded(trackId, env, userToken);
-    const info = buildVideoInfo(data?.streamingData);
-    if (info) { console.log(LOG_PREFIX, `video attached via WebEmbedded for ${trackId} (${info.height}p)`); return info; }
-  } catch (e) {
-    console.log(LOG_PREFIX, `video lookup (WebEmbedded) failed for ${trackId} (non-fatal):`, e.message);
-  }
-  // 3) LAST RESORT: iOS HLS manifest. Only reached when neither progressive
-  //    source had a >=240p rendition, to minimize extra iOS API calls.
-  try {
-    const data = await fetchPlayerData(trackId, env, userToken);
-    const hlsUrl = data?.streamingData?.hlsManifestUrl;
-    if (hlsUrl) { console.log(LOG_PREFIX, `video attached via iOS HLS for ${trackId}`); return { url: hlsUrl, mimeType: 'application/x-mpegURL', muxed: true }; }
-  } catch (e) {
-    console.log(LOG_PREFIX, `video lookup (iOS HLS) failed for ${trackId} (non-fatal):`, e.message);
-  }
+    const entry = JSON.parse(raw);
+    if (entry?.result?.url && entry.expiresAt > now + 60) {
+      STREAM_CACHE_L1.set(trackId, entry);
+      return entry.result;
+    }
+  } catch {}
   return null;
 }
-async function resolveIOS(trackId, env, userToken) {
-  const data = await fetchPlayerData(trackId, env, userToken);
-  const hlsUrl = data?.streamingData?.hlsManifestUrl;
-  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
-  throw new Error('no HLS');
+async function setCachedStream(env, trackId, result) {
+  if (!result?.url) return;
+  const expiresAt = urlExpirySeconds(result.url);
+  const now = Math.floor(Date.now() / 1000);
+  const ttl = Math.min(Math.max(expiresAt - now - 60, 0), 21600);
+  if (ttl < 60) return;
+  if (STREAM_CACHE_L1.size >= L1_MAX_ENTRIES) STREAM_CACHE_L1.clear();
+  const entry = { result, expiresAt };
+  STREAM_CACHE_L1.set(trackId, entry);
+  await upstashCmd(env, 'SET', `ytm:stream:${trackId}`, JSON.stringify(entry), 'EX', ttl);
 }
-async function resolveMWeb(trackId, env, userToken) {
-  const data = await fetchPlayerDataMWeb(trackId, env, userToken);
-  const hlsUrl = data?.streamingData?.hlsManifestUrl;
-  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
-  throw new Error('no usable format');
-}
-async function resolveWebCreator(trackId, env, userToken) {
-  const data = await fetchPlayerDataWebCreator(trackId, env, userToken);
-  const hlsUrl = data?.streamingData?.hlsManifestUrl;
-  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
-  throw new Error('no usable format');
-}
-async function resolveWebEmbedded(trackId, env, userToken) {
-  const data = await fetchPlayerDataWebEmbedded(trackId, env, userToken);
-  const hlsUrl = data?.streamingData?.hlsManifestUrl;
-  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
-  throw new Error('no usable format');
-}
-async function resolveAndroidVR(trackId, env, userToken) {
-  const data = await fetchPlayerDataAndroidVR(trackId, env, userToken);
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
-  throw new Error('no usable format');
-}
-// ── FIX: Sequential stream resolution instead of parallel ──────────────
-// Previously: Promise.allSettled fired all 6 resolvers at once, YouTube saw
-// 6 simultaneous player API calls from the same IP and blocked them all as
-// "Sign in to confirm you're not a bot". Now: try one at a time, return on
-// first success. Best case = 1 API call, worst case = 6 (but sequential).
-async function handleStream(trackId, env, userToken) {
-  // Always try all 9 clients (2.9.10 reverted a PO-gated skip after
-  // production logs showed AndroidNative resolving fine with zero bot
-  // errors even without a PO token — see changelog above).
-  //
-  // One inline PO-token refresh attempt still happens first if a generator
-  // URL is configured and nothing is cached — this only affects what gets
-  // attached to each request via withPoToken(), never which/how many
-  // clients get tried.
-  if (!(await getPoToken(env)) && env?.YT_PO_TOKEN_GENERATOR_URL) {
-    await tryRefreshPoToken(env);
-  }
 
-  const resolvers = [
-    { name: 'AndroidNative', run: () => resolveAndroidNative(trackId, env, userToken) },
-    { name: 'AndroidMusic', run: () => resolveAndroidMusic(trackId, env, userToken) },
-    { name: 'iOS', run: () => resolveIOS(trackId, env, userToken) },
-    { name: 'MWEB', run: () => resolveMWeb(trackId, env, userToken) },
-    { name: 'WebCreator', run: () => resolveWebCreator(trackId, env, userToken) },
-    { name: 'WebEmbedded', run: () => resolveWebEmbedded(trackId, env, userToken) },
-    { name: 'TV', run: () => resolveTV(trackId, env, userToken) },
-    { name: 'TVEmbedded', run: () => resolveTVEmbedded(trackId, env, userToken) },
-    { name: 'AndroidVR', run: () => resolveAndroidVR(trackId, env, userToken) },
-  ];
-  for (let i = 0; i < resolvers.length; i++) {
-    const resolver = resolvers[i];
-    // FIX (2.9.7): small randomized delay before each fallback attempt.
-    // Firing back-to-back player-API calls from the same Workers IP with
-    // zero spacing is itself a machine-pattern signature, independent of
-    // which client each call claims to be. Only sleep BETWEEN attempts
-    // (never before the first) so the common case — first resolver
-    // succeeds — pays no extra latency.
+async function resolveStream(kind, trackId, env, userToken) {
+  const data = await playerRequest(kind, trackId, env, userToken);
+  const sd = data?.streamingData || {};
+  const video = buildVideoInfo(sd);
+  const best = pickBestAudio(sd);
+  if (best) {
+    const result = { url: best.url, format: 'm4a', quality: 'native' };
+    if (video) result.video = video;
+    return result;
+  }
+  if (sd.hlsManifestUrl) {
+    const result = { url: sd.hlsManifestUrl, format: 'hls', quality: 'auto' };
+    if (video) result.video = video;
+    return result;
+  }
+  throw new PlayerError(`${PLAYER_CLIENTS[kind].label}: no usable format`);
+}
+
+async function handleStream(trackId, env, userToken) {
+  const cached = await getCachedStream(env, trackId);
+  if (cached) return cached;
+
+  const kinds = ['android', 'androidvr', 'ios'];
+  // Skip clients that are cooling down, unless every one of them is.
+  const available = kinds.filter(k => !clientCoolingDown(PLAYER_CLIENTS[k].label));
+  const order = available.length ? available : kinds;
+
+  let lastError = null;
+  for (let i = 0; i < order.length; i++) {
+    const kind = order[i];
+    // Small randomized gap between attempts only. Firing back-to-back player
+    // calls from one Worker IP with no spacing is itself a machine pattern.
     if (i > 0) await new Promise(r => setTimeout(r, 150 + Math.floor(Math.random() * 250)));
     try {
-      const result = await resolver.run();
-      if (result) {
-        console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}`);
-        // ADDITIVE ONLY: try to attach a `video` object (eclipsemusic.app/docs
-        // "Video Playback"). This is wrapped so it can never affect or block
-        // the audio result above — worst case, `video` is just left unset.
-        try {
-          const video = await fetchVideoInfo(trackId, env, userToken);
-          if (video) result.video = video;
-        } catch (e) {
-          console.log(LOG_PREFIX, `video attach skipped for ${trackId}:`, e.message);
-        }
-        return result;
-      }
+      const result = await resolveStream(kind, trackId, env, userToken);
+      console.log(LOG_PREFIX, `${PLAYER_CLIENTS[kind].label} resolved ${trackId}`);
+      await setCachedStream(env, trackId, result);
+      return result;
     } catch (e) {
-      console.log(LOG_PREFIX, `${resolver.name} failed for ${trackId}: ${e.message}`);
+      lastError = e;
+      if (e.botBlocked) {
+        coolDownClient(PLAYER_CLIENTS[kind].label);
+        console.log(LOG_PREFIX, `${PLAYER_CLIENTS[kind].label} bot-checked, cooling down 2m`);
+      }
+      console.log(LOG_PREFIX, `${PLAYER_CLIENTS[kind].label} failed for ${trackId}: ${e.message}`);
     }
   }
-  throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
+  throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}${lastError ? ' — ' + lastError.message : ''}`);
 }
 
 async function proxyDownload(trackId, incomingRequest, env, userToken) {
-  const data = await fetchPlayerDataAndroid(trackId, env, userToken);
-  const sd = data.streamingData;
-  if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for download`);
-  const best = pickBestAudio(sd);
-  if (!best) throw new Error(`${LOG_PREFIX} No downloadable audio for ${trackId}`);
-  const cdnUrl = best.url.includes('?') ? best.url + '&alr=yes' : best.url + '?alr=yes';
+  // Reuse a resolved URL (and its cache entry) when we already have one.
+  let cdnUrl = null;
+  const cached = await getCachedStream(env, trackId);
+  if (cached?.format === 'm4a' && cached.url) cdnUrl = cached.url;
+  if (!cdnUrl) {
+    const data = await playerRequest('android', trackId, env, userToken);
+    const best = pickBestAudio(data?.streamingData);
+    if (!best) throw new Error(`${LOG_PREFIX} No downloadable audio for ${trackId}`);
+    cdnUrl = best.url;
+    await setCachedStream(env, trackId, { url: best.url, format: 'm4a', quality: 'native' });
+  }
   const reqHeaders = {
-    'User-Agent': ANDROID_MUSIC_UA, 'Accept': '*/*', 'Accept-Language': 'en-US,en;q=0.9',
+    'User-Agent': ANDROID_NATIVE_UA, 'Accept': '*/*', 'Accept-Language': 'en-US,en;q=0.9',
     'Origin': 'https://music.youtube.com', 'Referer': 'https://music.youtube.com/',
   };
   if (env?.YT_COOKIE) reqHeaders['Cookie'] = env.YT_COOKIE;
@@ -1237,7 +983,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.11', description: v.description,
+    id: v.id, name: v.name, version: '2.10.0', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
@@ -1624,15 +1370,9 @@ export default {
       });
     }
 
-    if (env?.YT_PO_TOKEN_GENERATOR_URL && env?.UPSTASH_REDIS_REST_URL) {
-      const cached = await upstashCmd(env, 'GET', 'ytm:po_token');
-      if (!cached) {
-        console.log(LOG_PREFIX, 'No cached PO token — requests will run without BotGuard attestation until refresh completes');
-        tryRefreshPoToken(env);
-      }
-    } else if (!env?.YT_PO_TOKEN_GENERATOR_URL) {
-      console.log(LOG_PREFIX, 'YT_PO_TOKEN_GENERATOR_URL not configured — running with no PO token support at all');
-    }
+    // 2.10.0: no PO-token warmup here anymore — the working clients don't use
+    // PO tokens and the WEB-family clients that did are dead. Making an extra
+    // request on every single call was pure overhead.
 
     if (path === '/') return htmlRes(buildPage());
 
