@@ -866,7 +866,7 @@ const CDN_HEADERS = {
 // signs a URL for the address that minted it, and Cloudflare rotates its egress
 // address between subrequests, so minting and fetching from here intermittently
 // 403s. One machine doing both is the only way this is reliably correct.
-const MEDIA_PROXY = 'http://15.204.247.1:8080/k7f2q9w4e1r8t5y3u6i0o2p4a6s8d0g2';
+const MEDIA_PROXY = 'http://15-204-247-1.sslip.io:8080/k7f2q9w4e1r8t5y3u6i0o2p4a6s8d0g2';
 
 async function proxyMedia(trackId, kind, incomingRequest, env, userToken) {
   const method = incomingRequest.method === 'HEAD' ? 'HEAD' : 'GET';
