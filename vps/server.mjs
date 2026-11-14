@@ -954,13 +954,15 @@ function buildHls(target, head) {
     '#EXT-X-INDEPENDENT-SEGMENTS',
     '#EXT-X-MAP:URI="init"',
   ];
-  for (const s of segs) {
+  // Each fragment gets its own URL. Byte ranges work but are the least-travelled
+  // path in AVFoundation's HLS loader; a self-contained segment with its own
+  // Content-Length is what every player handles without question.
+  segs.forEach((s, i) => {
     lines.push(`#EXTINF:${s.secs.toFixed(5)},`);
-    lines.push(`#EXT-X-BYTERANGE:${s.size}@${s.offset}`);
-    lines.push('media');
-  }
+    lines.push(`media/${i}`);
+  });
   lines.push('#EXT-X-ENDLIST');
-  return { target, initEnd, duration, playlist: lines.join('\n') + '\n' };
+  return { target, initEnd, duration, segs, playlist: lines.join('\n') + '\n' };
 }
 
 async function hlsFor(videoId) {
@@ -977,7 +979,14 @@ async function hlsFor(videoId) {
   return out;
 }
 
-// Streams one fixed byte slice of the track, used for the init segment.
+function cmafBrand(buf) {
+  if (buf.length < 12 || buf.toString('latin1', 4, 8) !== 'ftyp') return buf;
+  const out = Buffer.from(buf);
+  out.write('iso6', 8, 'latin1');
+  return out;
+}
+
+// Streams one fixed byte slice of the track: the init segment and single fragments.
 async function streamSlice(req, res, kind, videoId, start, end) {
   const entry = await resolveOnce(videoId);
   const target = entry.audio;
@@ -995,9 +1004,13 @@ async function streamSlice(req, res, kind, videoId, start, end) {
   }
   let buf = Buffer.alloc(0);
   for await (const b of upstream.stream) buf = Buffer.concat([buf, b]);
-  buf = patchBrand(buf.subarray(0, end - start + 1), kind);
+  buf = buf.subarray(0, end - start + 1);
+  // The init segment is CMAF: its major brand belongs to the iso6 family. The
+  // raw file says 'dash' and the progressive path rewrites it to 'M4A ', a file
+  // brand that an HLS loader has no reason to accept.
+  if (start === 0) buf = cmafBrand(buf);
   res.writeHead(200, {
-    'content-type': 'video/mp4',
+    'content-type': kind === 'audio' ? 'audio/mp4' : 'video/mp4',
     'content-length': String(buf.length),
     'cache-control': 'no-store',
     'access-control-allow-origin': '*',
@@ -1042,7 +1055,7 @@ const server = http.createServer((req, res) => {
   // memo as /audio, so it never costs a second resolve. Only metadata goes back
   // — the signed media URL stays here, because it is bound to this address.
   // Playlist, init segment and the fragment bytes the playlist addresses.
-  const hls = /^hls\/([A-Za-z0-9_-]{6,20})\/(playlist\.m3u8|init|media)$/.exec(prefixPath);
+  const hls = /^hls\/([A-Za-z0-9_-]{6,20})\/(playlist\.m3u8|init|media(?:\/(\d+))?)$/.exec(prefixPath);
   if (hls) {
     const id = hls[1];
     console.log(new Date().toISOString(), 'hls', hls[2], id, '"' + String(req.headers['user-agent'] || '').slice(0, 70) + '"');
@@ -1067,6 +1080,25 @@ const server = http.createServer((req, res) => {
     if (hls[2] === 'init') {
       hlsFor(id).then(
         (built) => streamSlice(req, res, 'audio', id, 0, built.initEnd - 1),
+        (e) => {
+          res.writeHead(502, { 'content-type': 'text/plain' });
+          res.end('hls failed: ' + e.message);
+        }
+      );
+      return;
+    }
+    if (hls[3] !== undefined) {
+      const n = Number(hls[3]);
+      hlsFor(id).then(
+        (built) => {
+          const seg = built.segs[n];
+          if (!seg) {
+            res.writeHead(404, { 'content-type': 'text/plain' });
+            res.end('no such segment');
+            return;
+          }
+          return streamSlice(req, res, 'audio', id, seg.offset, seg.offset + seg.size - 1);
+        },
         (e) => {
           res.writeHead(502, { 'content-type': 'text/plain' });
           res.end('hls failed: ' + e.message);
