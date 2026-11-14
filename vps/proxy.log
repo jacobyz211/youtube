@@ -1,0 +1,17 @@
+ytm-media listening on 0.0.0.0:8080 (warp 172.16.0.2)
+2026-11-14T06:36:44.328Z resolve failed 73ouhDibImA ANDROID_VR LOGIN_REQUIRED: Sign in to confirm you’re not a bot
+2026-11-14T06:36:44.352Z limited url 73ouhDibImA ANDROID
+2026-11-14T06:36:44.382Z limited url 73ouhDibImA IOS
+2026-11-14T06:36:44.552Z resolve failed 73ouhDibImA TVHTML5 UNPLAYABLE: The page needs to be reloaded.
+2026-11-14T06:36:44.563Z VISIONOS resolved 73ouhDibImA 2931901
+2026-11-14T06:36:44.603Z resolve failed 73ouhDibImA ANDROID_MUSIC LOGIN_REQUIRED: Please sign in
+2026-11-14T06:36:45.193Z get audio 73ouhDibImA no-range
+2026-11-14T06:36:46.168Z done audio 73ouhDibImA sent 2931901 of 2931901 975ms 
+2026-11-14T06:36:54.982Z resolve failed Kf5pXDhx5Vc ANDROID_VR LOGIN_REQUIRED: Sign in to confirm you’re not a bot
+2026-11-14T06:36:55.056Z limited url Kf5pXDhx5Vc ANDROID
+2026-11-14T06:36:55.062Z VISIONOS resolved Kf5pXDhx5Vc 2580599
+2026-11-14T06:36:55.062Z get audio Kf5pXDhx5Vc bytes=0-63
+2026-11-14T06:36:55.103Z done audio Kf5pXDhx5Vc sent 64 of 2580599 41ms 
+2026-11-14T06:36:55.170Z limited url Kf5pXDhx5Vc IOS
+2026-11-14T06:36:55.269Z get audio Kf5pXDhx5Vc bytes=0-
+2026-11-14T06:36:56.219Z done audio Kf5pXDhx5Vc sent 2580599 of 2580599 950ms 

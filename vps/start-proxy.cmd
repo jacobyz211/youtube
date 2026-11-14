@@ -9,9 +9,13 @@ set YTM_WARP_LOCAL_ADDR=
 set YTM_YTDLP=
 set PORT=8080
 
+rem Keep a log next to this script: when a track will not start, the question is
+rem whether the app ever asked for the bytes, and only the log can answer it.
+if exist "%~dp0proxy.log" for %%A in ("%~dp0proxy.log") do if %%~zA GTR 5000000 del "%~dp0proxy.log"
+
 netstat -ano | findstr /r /c:"LISTENING" | findstr ":8080" >nul 2>&1
 if errorlevel 1 (
-  start "ytm-proxy" /min cmd /c "node ""%~dp0server.mjs"""
+  start "ytm-proxy" /min cmd /c "node ""%~dp0server.mjs"" >> ""%~dp0proxy.log"" 2>&1"
   echo Started the media proxy on port 8080.
 ) else (
   echo Media proxy already running on port 8080.

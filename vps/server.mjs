@@ -687,6 +687,20 @@ function openChunk(target, ua, start, end) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// YouTube's adaptive audio is fragmented MP4 whose ftyp major brand is "dash".
+// The bytes are perfectly valid, but AVFoundation and Media Foundation both
+// refuse a file they see tagged that way, which is why a track that streams
+// cleanly through curl would never start in the app. Only the four brand bytes
+// change, so the offsets the player asked for stay exactly where they were.
+function patchBrand(buf, kind) {
+  if (buf.length < 12) return buf;
+  if (buf.toString('latin1', 4, 8) !== 'ftyp') return buf;
+  if (buf.toString('latin1', 8, 12) !== 'dash') return buf;
+  const out = Buffer.from(buf);
+  out.write(kind === 'video' ? 'mp42' : 'M4A ', 8, 4, 'latin1');
+  return out;
+}
+
 async function streamMedia(req, res, kind, videoId) {
   // A player that goes away mid-track must not take the process with it.
   res.on('error', () => {});
@@ -745,6 +759,11 @@ async function streamMedia(req, res, kind, videoId) {
   let pos = start;
   let remints = 0;
   let retries = 0;
+  // Every byte actually handed to the player, so a log line can tell a track
+  // that never started from one that was delivered and rejected.
+  let sent = 0;
+  const beganAt = Date.now();
+  console.log(new Date().toISOString(), 'get', kind, videoId, req.headers.range || 'no-range');
 
   while (total === null || pos <= end) {
     const chunkEnd = total === null ? pos + CHUNK_BYTES - 1 : Math.min(pos + CHUNK_BYTES - 1, end);
@@ -805,8 +824,10 @@ async function streamMedia(req, res, kind, videoId) {
           upstream.stream.destroy();
           return;
         }
-        got += buf.length;
-        if (!res.write(buf)) await once(res, 'drain');
+        const out = pos === 0 && got === 0 ? patchBrand(buf, kind) : buf;
+        got += out.length;
+        if (!res.write(out)) await once(res, 'drain');
+        sent += out.length;
       }
     } catch {
       failed = true;
@@ -831,6 +852,7 @@ async function streamMedia(req, res, kind, videoId) {
     retries = 0;
   }
 
+  console.log(new Date().toISOString(), 'done', kind, videoId, 'sent', sent, 'of', total ?? '?', Date.now() - beganAt + 'ms', res.destroyed ? 'client-gone' : '');
   res.end();
 }
 
