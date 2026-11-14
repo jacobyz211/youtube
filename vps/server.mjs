@@ -763,7 +763,9 @@ async function streamMedia(req, res, kind, videoId) {
   // that never started from one that was delivered and rejected.
   let sent = 0;
   const beganAt = Date.now();
-  console.log(new Date().toISOString(), 'get', kind, videoId, req.headers.range || 'no-range');
+  // The UA is what identifies the player that is failing, and the range shape
+  // tells whether it expects a seekable file at all.
+  console.log(new Date().toISOString(), 'get', kind, videoId, req.headers.range || 'no-range', '"' + String(req.headers['user-agent'] || '').slice(0, 90) + '"');
 
   while (total === null || pos <= end) {
     const chunkEnd = total === null ? pos + CHUNK_BYTES - 1 : Math.min(pos + CHUNK_BYTES - 1, end);

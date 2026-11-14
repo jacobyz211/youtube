@@ -931,12 +931,24 @@ function buildStreamResponse(trackId, origin, meta) {
 // finished before the app asks for bytes, and so this reply can advertise the
 // video rendition. A track that fails comes back without meta and /audio then
 // reports the real error.
+//
+// The wait is short on purpose. Eclipse's guidance is that /stream must answer
+// inside three seconds, and it retries (and then moves to the next addon) when
+// it does not. Waiting on a cold tunnel put this reply over that line for the
+// sake of a video toggle, so the cap is well under it: whatever has not arrived
+// by then simply does not make the reply, and the resolve carries on behind the
+// scenes while the player pulls bytes from /audio.
+const WARM_BUDGET_MS = 1200;
+
 async function warmTrack(trackId) {
+  const deadline = Date.now() + WARM_BUDGET_MS;
   for (const base of mediaProxyOrder()) {
+    const left = deadline - Date.now();
+    if (left < 80) break;
     try {
       const res = await fetch(`${base}/prewarm/${encodeURIComponent(trackId)}`, {
         method: 'POST',
-        signal: AbortSignal.timeout(6000),
+        signal: AbortSignal.timeout(left),
       });
       if (!res.ok) continue;
       const meta = await res.json().catch(() => null);
