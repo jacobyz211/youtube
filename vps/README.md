@@ -121,19 +121,31 @@ ANDROID call that produces the muxed rendition is now started once at the
 beginning of the resolve, shared with the race, and awaited in parallel with the
 audio probe.
 
-## Tracks are served as HLS, not as one file
+## Tracks are served as one plain M4A file
 
 YouTube's audio is fragmented MP4: a 759-byte init segment, then a list of
-`moof`/`mdat` fragments of about ten seconds each. Handed over as one progressive
-file, AVFoundation refuses it — the app reports "the data couldn't be read because
-it isn't in the correct format" while every byte arrives — so the same bytes are
-described as an HLS playlist instead: `/hls/<id>/playlist.m3u8` lists one init
-segment plus one entry per fragment, each addressed as a byte range read straight
-out of the file's own `sidx` index. Nothing is transcoded and no byte is moved.
+`moof`/`mdat` fragments of about ten seconds each. There is no sample table, so
+a file reader has nothing to walk and refuses it — "the data couldn't be read
+because it isn't in the correct format" — while every byte arrives.
 
-The fragment table is trusted only after it checks out: every reference must
-land on a `moof` box, and the sizes must sum to the file. If a track has no usable
-index the playlist is refused rather than guessed at.
+`/m4a/<id>` remuxes it into an ordinary M4A: the sample sizes and durations are
+read out of each fragment's `moof`, new `stts`/`stsz`/`stsc`/`stco` tables are
+written for exactly those samples, and the sample bytes are gathered into one
+`mdat` in order. The codec description (`stsd`/`esds`) is carried over from the
+source `moov`. Nothing is decoded or re-encoded, no sample byte changes, and the
+result is checked before it is served: the sample count must agree across `stts`,
+`stsz` and `stsc`, the sizes must sum to the `mdat` payload, and every chunk
+offset must land inside the file. A track that fails the check is refused rather
+than served half-described. Built files are held in RAM for ten minutes.
+
+The remuxer is trusted only after it checks out: every fragment must yield
+per-sample sizes and durations, and the sizes must sum to the file. If a track
+cannot be described the request is refused rather than guessed at.
+
+`/hls/<id>/playlist.m3u8` still exists and is correct — it serves the same bytes
+as a playlist off the file's own `sidx` index — but it is not what `/stream`
+advertises: a playlist is not a direct link to an audio file, and Eclipse's engine
+opens files. Kept because it is the shortest way to check the fragments by hand.
 
 ## Every reply declares its length
 

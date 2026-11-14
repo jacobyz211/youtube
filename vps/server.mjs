@@ -1019,6 +1019,299 @@ async function streamSlice(req, res, kind, videoId, start, end) {
   res.end();
 }
 
+// ── Plain M4A ───────────────────────────────────────────────────────────
+// The last piece of the puzzle, and the one Eclipse can actually play.
+//
+// HLS is correct and Safari plays it, but an addon's contract is a direct link
+// to an audio file, and Eclipse's engine wants a file it can open and seek, not
+// a playlist. The source is fragmented MP4: its sample sizes and durations live
+// in each fragment's moof, and there is no sample table for a file reader to
+// walk, so anything that opens files rather than playing manifests refuses it.
+//
+// So the sample tables are rebuilt here — stts/stsz/stsc/stco describing the same
+// samples, gathered into one mdat — and the result is an ordinary M4A. No audio
+// is decoded or re-encoded: every sample byte is copied through untouched, and
+// the codec description (stsd/esds) is carried over from the source moov.
+const M4A_CACHE_MS = 10 * 60 * 1000;
+const m4aCache = new Map();
+const m4aInflight = new Map();
+
+const MATRIX = Buffer.concat([
+  Buffer.from([0, 1, 0, 0]), Buffer.from([0, 0, 0, 0]), Buffer.from([0, 0, 0, 0]),
+  Buffer.from([0, 0, 0, 0]), Buffer.from([0, 1, 0, 0]), Buffer.from([0, 0, 0, 0]),
+  Buffer.from([0, 0, 0, 0]), Buffer.from([0, 0, 0, 0]), Buffer.from([0x40, 0, 0, 0]),
+]);
+
+function u16(n) {
+  const b = Buffer.alloc(2);
+  b.writeUInt16BE(n & 0xffff, 0);
+  return b;
+}
+function u32(...ns) {
+  const b = Buffer.alloc(ns.length * 4);
+  ns.forEach((n, i) => b.writeUInt32BE(n >>> 0, i * 4));
+  return b;
+}
+function big(n) {
+  const b = Buffer.alloc(8);
+  b.writeBigUInt64BE(BigInt(n), 0);
+  return b;
+}
+function box(type, ...parts) {
+  const body = Buffer.concat(parts.map((p) => Buffer.from(p)));
+  const out = Buffer.alloc(8 + body.length);
+  out.writeUInt32BE(out.length, 0);
+  out.write(type, 4, 'latin1');
+  body.copy(out, 8);
+  return out;
+}
+
+// Child boxes of [from,to). Returns [{ type, start, size }] in file order.
+function scanBoxes(b, from, to) {
+  const out = [];
+  let o = from;
+  while (o + 8 <= to) {
+    let size = b.readUInt32BE(o);
+    const type = b.toString('latin1', o + 4, o + 8);
+    if (size === 1) size = Number(b.readBigUInt64BE(o + 8));
+    else if (size === 0) size = to - o;
+    if (size < 8 || o + size > to) break;
+    out.push({ type, start: o, size });
+    o += size;
+  }
+  return out;
+}
+function findBox(list, type) {
+  return list.find((x) => x.type === type) || null;
+}
+
+// fMP4 → plain M4A. Returns null when the input is not the shape we can remux.
+function buildM4aFromFmp4(buf) {
+  const top = scanBoxes(buf, 0, buf.length);
+  const moov = findBox(top, 'moov');
+  if (!moov) return null;
+  const moovEnd = moov.start + moov.size;
+  const moovKids = scanBoxes(buf, moov.start + 8, moovEnd);
+  const mvhd = findBox(moovKids, 'mvhd');
+  const trak = findBox(moovKids, 'trak');
+  if (!mvhd || !trak) return null;
+  const trakEnd = trak.start + trak.size;
+  const mdia = findBox(scanBoxes(buf, trak.start + 8, trakEnd), 'mdia');
+  if (!mdia) return null;
+  const mdiaEnd = mdia.start + mdia.size;
+  const mdiaKids = scanBoxes(buf, mdia.start + 8, mdiaEnd);
+  const mdhd = findBox(mdiaKids, 'mdhd');
+  const hdlr = findBox(mdiaKids, 'hdlr');
+  const minf = findBox(mdiaKids, 'minf');
+  if (!mdhd || !hdlr || !minf) return null;
+  const minfEnd = minf.start + minf.size;
+  const minfKids = scanBoxes(buf, minf.start + 8, minfEnd);
+  const dinf = findBox(minfKids, 'dinf');
+  const smhd = findBox(minfKids, 'smhd');
+  const stbl = findBox(minfKids, 'stbl');
+  if (!dinf || !smhd || !stbl) return null;
+  const stblKids = scanBoxes(buf, stbl.start + 8, stbl.start + stbl.size);
+  const stsd = findBox(stblKids, 'stsd');
+  if (!stsd) return null;
+
+  const mvhdVer = buf[mvhd.start + 8];
+  const movieTimescale = buf.readUInt32BE(mvhd.start + (mvhdVer === 1 ? 28 : 20));
+  const mdhdVer = buf[mdhd.start + 8];
+  const mediaTimescale = buf.readUInt32BE(mdhd.start + (mdhdVer === 1 ? 28 : 20));
+  if (!movieTimescale || !mediaTimescale) return null;
+
+  // Walk every fragment and read its sample sizes/durations out of tfhd/trun.
+  const frags = [];
+  for (const b of top) {
+    if (b.type !== 'moof') continue;
+    const traf = findBox(scanBoxes(buf, b.start + 8, b.start + b.size), 'traf');
+    if (!traf) continue;
+    const trafKids = scanBoxes(buf, traf.start + 8, traf.start + traf.size);
+    const tfhd = findBox(trafKids, 'tfhd');
+    const trun = findBox(trafKids, 'trun');
+    if (!tfhd || !trun) continue;
+
+    const tfFlags = buf.readUInt32BE(tfhd.start + 8) & 0xffffff;
+    let p = tfhd.start + 16;
+    let baseDataOffset = null;
+    if (tfFlags & 0x1) { baseDataOffset = Number(buf.readBigUInt64BE(p)); p += 8; }
+    if (tfFlags & 0x2) p += 4;
+    let defDur = 0;
+    let defSize = 0;
+    if (tfFlags & 0x8) { defDur = buf.readUInt32BE(p); p += 4; }
+    if (tfFlags & 0x10) { defSize = buf.readUInt32BE(p); p += 4; }
+
+    const trFlags = buf.readUInt32BE(trun.start + 8) & 0xffffff;
+    const count = buf.readUInt32BE(trun.start + 12);
+    let q = trun.start + 16;
+    let dataOffset = 0;
+    if (trFlags & 0x1) { dataOffset = buf.readInt32BE(q); q += 4; }
+    if (trFlags & 0x4) q += 4;
+
+    const samples = [];
+    let bytes = 0;
+    for (let i = 0; i < count; i++) {
+      let dur = defDur;
+      let size = defSize;
+      if (trFlags & 0x100) { dur = buf.readUInt32BE(q); q += 4; }
+      if (trFlags & 0x200) { size = buf.readUInt32BE(q); q += 4; }
+      if (trFlags & 0x400) q += 4;
+      if (trFlags & 0x800) q += 4;
+      if (!size || !dur) return null; // a sample table we cannot describe is useless
+      samples.push({ dur, size });
+      bytes += size;
+    }
+    if (!samples.length) continue;
+    const base = tfFlags & 0x020000 || baseDataOffset === null ? b.start : baseDataOffset;
+    const dataStart = base + dataOffset;
+    if (dataStart + bytes > buf.length) return null;
+    frags.push({ samples, dataStart, bytes });
+  }
+  if (!frags.length) return null;
+
+  // stts: run-length encode the sample durations.
+  const sttsEntries = [];
+  let totalDur = 0;
+  for (const f of frags) {
+    for (const s of f.samples) {
+      totalDur += s.dur;
+      const last = sttsEntries[sttsEntries.length - 1];
+      if (last && last.dur === s.dur) last.count++;
+      else sttsEntries.push({ count: 1, dur: s.dur });
+    }
+  }
+
+  // stsz: one entry per sample unless every sample is the same size.
+  const sizes = [];
+  for (const f of frags) for (const s of f.samples) sizes.push(s.size);
+  const uniform = sizes.every((s) => s === sizes[0]);
+
+  // stsc: one chunk per fragment; entries are runs of equal samples_per_chunk.
+  const stscEntries = [];
+  frags.forEach((f, i) => {
+    const n = f.samples.length;
+    const last = stscEntries[stscEntries.length - 1];
+    if (last && last.n === n) return;
+    stscEntries.push({ first: i + 1, n });
+  });
+
+  const stsdBox = buf.subarray(stsd.start, stsd.start + stsd.size);
+  const hdlrBox = buf.subarray(hdlr.start, hdlr.start + hdlr.size);
+  const dinfBox = buf.subarray(dinf.start, dinf.start + dinf.size);
+  const smhdBox = buf.subarray(smhd.start, smhd.start + smhd.size);
+  const movieDur = Math.round((totalDur / mediaTimescale) * movieTimescale);
+
+  const buildMoov = (chunkOffsets) => {
+    const stts = box('stts', u32(0), u32(sttsEntries.length),
+      Buffer.concat(sttsEntries.map((e) => u32(e.count, e.dur))));
+    const stsz = uniform
+      ? box('stsz', u32(0), u32(sizes[0]), u32(sizes.length))
+      : box('stsz', u32(0), u32(0), u32(sizes.length), Buffer.concat(sizes.map((s) => u32(s))));
+    const stsc = box('stsc', u32(0), u32(stscEntries.length),
+      Buffer.concat(stscEntries.map((e) => u32(e.first, e.n, 1))));
+    const stco = box('stco', u32(0), u32(chunkOffsets.length), Buffer.concat(chunkOffsets.map((o) => u32(o))));
+    const minfBox = box('minf', smhdBox, dinfBox, box('stbl', stsdBox, stts, stsc, stsz, stco));
+    // No edit list and no mvex: this is a plain, fully described file. The edit
+    // list in the source only skipped the encoder's priming samples, and an
+    // incomplete sample table plus an edit list is two things to get wrong.
+    const mdhdBox = box('mdhd', u32(0), u32(0, 0, mediaTimescale, totalDur), u16(0x55c4), u16(0));
+    const tkhdBox = box('tkhd', u32(7), u32(0, 0, 1, 0, movieDur), u32(0, 0),
+      u16(0), u16(0), u16(0x0100), u16(0), MATRIX, u32(0, 0));
+    const mvhdBox = box('mvhd', u32(0), u32(0, 0, movieTimescale, movieDur),
+      u32(0x00010000), u16(0x0100), u16(0), u32(0, 0), MATRIX, u32(0, 0, 0, 0, 0, 0), u32(2));
+    return box('moov', mvhdBox, box('trak', tkhdBox, box('mdia', mdhdBox, hdlrBox, minfBox)));
+  };
+
+  // Two passes: the chunk offsets depend on the size of the moov that carries
+  // them, and that size is fixed by the number of chunks.
+  const ftypBox = box('ftyp', Buffer.from('M4A ', 'latin1'), u32(0), Buffer.from('M4A mp42isomiso6', 'latin1'));
+  const probe = buildMoov(frags.map(() => 0));
+  const dataStartInFile = ftypBox.length + probe.length + 8;
+  const chunkOffsets = [];
+  let at = dataStartInFile;
+  for (const f of frags) {
+    chunkOffsets.push(at);
+    at += f.bytes;
+  }
+  const moovBox = buildMoov(chunkOffsets);
+  if (moovBox.length !== probe.length) return null;
+
+  const media = Buffer.concat(frags.map((f) => buf.subarray(f.dataStart, f.dataStart + f.bytes)));
+  return Buffer.concat([ftypBox, moovBox, box('mdat', media)]);
+}
+
+async function wholeFile(entry) {
+  const total = entry.total || 0;
+  const r = await request(entry.audio, {
+    headers: { range: `bytes=0-${total ? total - 1 : 100000000}`, 'user-agent': entry.ua, origin: 'https://www.youtube.com' },
+    follow: 3,
+    timeout: 25000,
+  });
+  if (r.status !== 200 && r.status !== 206) {
+    r.stream.resume();
+    throw new Error('upstream ' + r.status);
+  }
+  const chunks = [];
+  for await (const b of r.stream) chunks.push(b);
+  return Buffer.concat(chunks);
+}
+
+async function m4aFor(videoId) {
+  const hit = m4aCache.get(videoId);
+  if (hit && hit.exp > Date.now()) return hit;
+  if (m4aInflight.has(videoId)) return m4aInflight.get(videoId);
+  const job = (async () => {
+    const entry = await resolveOnce(videoId);
+    if (!entry.audio) throw new Error('no audio');
+    const raw = await wholeFile(entry);
+    const out = buildM4aFromFmp4(raw);
+    if (!out) throw new Error('remux failed');
+    const rec = { buf: out, exp: Date.now() + M4A_CACHE_MS };
+    while (m4aCache.size >= 12) m4aCache.delete(m4aCache.keys().next().value);
+    m4aCache.set(videoId, rec);
+    return rec;
+  })().finally(() => m4aInflight.delete(videoId));
+  m4aInflight.set(videoId, job);
+  return job;
+}
+
+async function streamM4a(req, res, videoId) {
+  let rec;
+  try {
+    rec = await m4aFor(videoId);
+  } catch (e) {
+    console.log(new Date().toISOString(), 'm4a failed', videoId, e.message);
+    res.writeHead(502, { 'content-type': 'text/plain' });
+    res.end('m4a failed: ' + e.message);
+    return;
+  }
+  const buf = rec.buf;
+  const total = buf.length;
+  const range = parseRange(req.headers.range, total);
+  let start = range ? range.start : 0;
+  let end = range && range.end !== null ? Math.min(range.end, total - 1) : total - 1;
+  if (start >= total) {
+    res.writeHead(416, { 'content-range': `bytes */${total}` });
+    res.end();
+    return;
+  }
+  const headers = {
+    'content-type': 'audio/mp4',
+    'accept-ranges': 'bytes',
+    'content-length': String(end - start + 1),
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
+  };
+  if (range) headers['content-range'] = `bytes ${start}-${end}/${total}`;
+  res.writeHead(range ? 206 : 200, headers);
+  console.log(new Date().toISOString(), 'm4a', videoId, total, req.headers.range || 'no-range');
+  if (req.method === 'HEAD') {
+    res.end();
+    return;
+  }
+  res.end(buf.subarray(start, end + 1));
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
 
@@ -1107,6 +1400,16 @@ const server = http.createServer((req, res) => {
       return;
     }
     streamMedia(req, res, 'audio', id);
+    return;
+  }
+
+  const m4a = /^m4a\/([A-Za-z0-9_-]{6,20})$/.exec(prefixPath);
+  if (m4a) {
+    streamM4a(req, res, m4a[1]).catch((e) => {
+      console.log(new Date().toISOString(), 'm4a handler error', e.message);
+      if (!res.headersSent) res.writeHead(500, { 'content-type': 'text/plain' });
+      res.end('error');
+    });
     return;
   }
 

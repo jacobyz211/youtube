@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.18.0 — replies carry their length
+// author: ricky | version: 2.19.0 — plain M4A stream from the proxy
 //
 // WHAT CHANGED IN 2.16.0 — a seeked start (Range: bytes=0-) came back as a
 // chunked 206 with no Content-Length, and a player with no length to size a
@@ -826,7 +826,7 @@ async function resolveStream(kind, trackId, env, userToken) {
   if (!url) throw new PlayerError(`${PLAYER_CLIENTS[kind].label}: no usable format`);
   return {
     url,
-    format: best ? 'm4a' : 'hls',
+    format: 'm4a',
     quality: best ? 'native' : 'auto',
     expiresAt: urlExpirySeconds(url),
     video: video || null,
@@ -898,22 +898,23 @@ async function resolveTrack(trackId, env, userToken) {
 // YouTube's "confirm you're not a bot" challenge.
 const STREAM_TTL_SEC = 6 * 3600;
 
-// HLS, not a single file. YouTube's audio is fragmented MP4, and AVFoundation
-// answers a progressive fMP4 with "the data couldn't be read because it isn't in
-// the correct format" while every byte arrives. The same bytes described as an
-// HLS playlist — one init segment plus one entry per fragment, each a byte range
-// of the track — play natively in Eclipse, so that is what /stream advertises.
+// A direct link to an audio file, which is what the addon contract asks for and
+// what Eclipse's engine expects. YouTube's audio is fragmented MP4: its samples
+// are described per fragment in moof boxes, and there is no sample table, so a
+// file reader — as opposed to a manifest player — has nothing to walk and
+// refuses it. (HLS was tried here and plays in Safari, but Eclipse does not take
+// that path, so the same bytes are instead remuxed on the proxy into a plain
+// M4A with real stts/stsz/stsc/stco tables. Nothing is re-encoded.)
 function buildStreamResponse(trackId, origin, meta) {
   const base = (origin || '').replace(/\/+$/, '');
   const out = {
-    url: `${base}/hls/${trackId}/playlist.m3u8`,
-    format: 'aac',
+    url: `${base}/m4a/${trackId}`,
+    format: 'm4a',
     quality: 'native',
     codec: 'aac',
-    container: 'fmp4',
-    // Routing fields: tell the app the bytes are a playlist, so it picks the HLS
-    // engine before the first byte instead of probing the media.
-    manifest: 'hls',
+    container: 'mp4',
+    // Routing fields: the URL is the audio file itself, not a playlist.
+    manifest: 'none',
     encrypted: false,
     expiresAt: Math.floor(Date.now() / 1000) + STREAM_TTL_SEC,
   };
@@ -1055,6 +1056,49 @@ async function proxyHls(rest, incomingRequest) {
     const cr = upstream.headers.get('content-range');
     if (cr) out['content-range'] = cr;
   }
+  return new Response(method === 'HEAD' ? null : upstream.body, { status: upstream.status, headers: out });
+}
+
+// Plain M4A: the track remuxed on the proxy into an ordinary file with sample
+// tables. Same rule as the HLS path — one box mints the URL and serves bytes —
+// and Range passes through, because a player that can seek asks for the tail.
+const M4A_PATH = /^\/m4a\/([A-Za-z0-9_-]{6,20})$/;
+
+async function proxyM4a(rest, incomingRequest) {
+  const m = M4A_PATH.exec(rest);
+  if (!m) return jsonRes({ error: 'Not found' }, 404);
+  const id = m[1];
+  const method = incomingRequest.method === 'HEAD' ? 'HEAD' : 'GET';
+  const clientRange = incomingRequest.headers.get('range');
+
+  let upstream = null;
+  for (const base of mediaProxyOrder()) {
+    try {
+      const res = await fetch(`${base}/m4a/${id}`, {
+        method,
+        headers: clientRange ? { range: clientRange } : {},
+      });
+      if (res.ok || res.status === 206) {
+        upstream = res;
+        break;
+      }
+    } catch {
+      // Try the other box; a dead tunnel refuses in milliseconds.
+    }
+  }
+  if (!upstream) throw new Error(`${LOG_PREFIX} m4a unavailable for ${id}`);
+
+  const out = {
+    'content-type': 'audio/mp4',
+    'accept-ranges': 'bytes',
+    'access-control-allow-origin': '*',
+    'access-control-expose-headers': 'Content-Range, Content-Length, Accept-Ranges',
+    'cache-control': 'no-store',
+  };
+  const len = upstream.headers.get('content-length');
+  if (len) out['content-length'] = len;
+  const cr = upstream.headers.get('content-range');
+  if (cr) out['content-range'] = cr;
   return new Response(method === 'HEAD' ? null : upstream.body, { status: upstream.status, headers: out });
 }
 
@@ -1292,7 +1336,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.18.0', description: v.description,
+    id: v.id, name: v.name, version: '2.19.0', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
@@ -1543,6 +1587,7 @@ if (ECLIPSE_GATED_PREFIXES.some((p) => rest === p || rest.startsWith(p + "/"))) 
   // URL is only valid from the IP that minted it. These two are deliberately
   // not behind the Eclipse gate — a player fetching an audio URL does not send
   // the addon's access header.
+  if (rest.startsWith('/m4a/')) return await proxyM4a(rest, request);
   if (rest.startsWith('/hls/')) return await proxyHls(rest, request);
   if (rest.startsWith('/audio/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return await proxyMedia(id, 'audio', request, env, userToken); }
   if (rest.startsWith('/video/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return await proxyMedia(id, 'video', request, env, userToken); }
