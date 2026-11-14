@@ -1,5 +1,14 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.13.0 — video support for Eclipse
+// author: ricky | version: 2.14.0 — media from the home laptop
+//
+// WHAT CHANGED IN 2.14.0 — licensed art tracks (the "- Topic" uploads that are
+// almost every song in YouTube Music) answer UNPLAYABLE from every address this
+// Worker's helpers could reach: Cloudflare, the VPS's own OVH IP, Cloudflare
+// WARP, and ten different client identities. A signed-in cookie did not help
+// (the session was verified as signed in), and neither did PO tokens. The same
+// request from a residential connection returns a playable URL, so media now
+// goes through a proxy on the home network over a Cloudflare tunnel, with the
+// VPS kept as the fallback for when that machine is asleep.
 //
 // WHAT CHANGED IN 2.13.0 — /stream never advertised a video, so Eclipse had no
 // toggle to offer and the /video route was never called. It now sends the
@@ -880,17 +889,24 @@ function buildStreamResponse(trackId, origin, meta) {
 // video rendition. A track that fails comes back without meta and /audio then
 // reports the real error.
 async function warmTrack(trackId) {
-  try {
-    const res = await fetch(`${MEDIA_PROXY}/prewarm/${encodeURIComponent(trackId)}`, {
-      method: 'POST',
-      signal: AbortSignal.timeout(6000),
-    });
-    if (!res.ok) return null;
-    const meta = await res.json().catch(() => null);
-    return meta && meta.ok ? meta : null;
-  } catch {
-    return null;
+  for (const base of mediaProxyOrder()) {
+    try {
+      const res = await fetch(`${base}/prewarm/${encodeURIComponent(trackId)}`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(6000),
+      });
+      if (!res.ok) {
+        if (base === MEDIA_PROXY_HOME) markHomeDown();
+        continue;
+      }
+      const meta = await res.json().catch(() => null);
+      if (base === MEDIA_PROXY_HOME && meta && meta.ok === false) return null;
+      return meta && meta.ok ? meta : null;
+    } catch {
+      if (base === MEDIA_PROXY_HOME) markHomeDown();
+    }
   }
+  return null;
 }
 
 async function handleStream(trackId, env, userToken, origin) {
@@ -912,21 +928,62 @@ const CDN_HEADERS = {
 // signs a URL for the address that minted it, and Cloudflare rotates its egress
 // address between subrequests, so minting and fetching from here intermittently
 // 403s. One machine doing both is the only way this is reliably correct.
-const MEDIA_PROXY = 'http://15-204-247-1.sslip.io:8080/k7f2q9w4e1r8t5y3u6i0o2p4a6s8d0g2';
+//
+// Two boxes, tried in order. The laptop at home is first because licensed art
+// tracks answer UNPLAYABLE from every datacenter and VPN address, and only a
+// residential connection gets a playable URL — proven by testing the same
+// request from the home connection and from the VPS. The VPS stays second: it
+// still resolves ordinary video tracks, so a laptop that is asleep degrades to
+// yesterday's behaviour instead of breaking playback outright.
+const MEDIA_PROXY_HOME = 'https://cinema-productive-limit-brian.trycloudflare.com/k7f2q9w4e1r8t5y3u6i0o2p4a6s8d0g2';
+const MEDIA_PROXY_VPS = 'http://15-204-247-1.sslip.io:8080/k7f2q9w4e1r8t5y3u6i0o2p4a6s8d0g2';
+
+// When the laptop is off, the tunnel refuses the connection fast and then so
+// does every following request. One minute of silence keeps a sleeping machine
+// from costing a timeout on each player action.
+let homeDownUntil = 0;
+const HOME_COOLDOWN_MS = 60 * 1000;
+
+function markHomeDown() {
+  homeDownUntil = Date.now() + HOME_COOLDOWN_MS;
+}
+
+function mediaProxyOrder() {
+  return Date.now() >= homeDownUntil ? [MEDIA_PROXY_HOME, MEDIA_PROXY_VPS] : [MEDIA_PROXY_VPS];
+}
 
 async function proxyMedia(trackId, kind, incomingRequest, env, userToken) {
   const method = incomingRequest.method === 'HEAD' ? 'HEAD' : 'GET';
   const clientRange = incomingRequest.headers.get('range');
-  const target = `${MEDIA_PROXY}/${kind}/${encodeURIComponent(trackId)}`;
 
-  const upstream = await fetch(target, {
-    method,
-    headers: clientRange ? { range: clientRange } : {},
-  });
+  let upstream = null;
+  let failure = null;
+  for (const base of mediaProxyOrder()) {
+    try {
+      const res = await fetch(`${base}/${kind}/${encodeURIComponent(trackId)}`, {
+        method,
+        headers: clientRange ? { range: clientRange } : {},
+      });
+      if (res.ok || res.status === 206) {
+        upstream = res;
+        break;
+      }
+      // The box answered, so it is awake — but it cannot serve this track. Try
+      // the other one before giving up, since only home can serve art tracks.
+      failure = res;
+      if (base === MEDIA_PROXY_HOME) continue;
+    } catch (e) {
+      if (base === MEDIA_PROXY_HOME) markHomeDown();
+      failure = failure || e;
+    }
+  }
 
-  if (!upstream.ok && upstream.status !== 206) {
-    const detail = await upstream.text().catch(() => '');
-    throw new Error(`${LOG_PREFIX} media ${upstream.status} for ${trackId}${detail ? ' — ' + detail.slice(0, 200) : ''}`);
+  if (!upstream) {
+    if (failure instanceof Response) {
+      const detail = await failure.text().catch(() => '');
+      throw new Error(`${LOG_PREFIX} media ${failure.status} for ${trackId}${detail ? ' — ' + detail.slice(0, 200) : ''}`);
+    }
+    throw new Error(`${LOG_PREFIX} media proxy unreachable for ${trackId}${failure ? ' — ' + String(failure.message || failure) : ''}`);
   }
 
   let status = upstream.status;
@@ -1122,7 +1179,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.13.0', description: v.description,
+    id: v.id, name: v.name, version: '2.14.0', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],

@@ -11,7 +11,28 @@ one fixed address, so the mint and the fetch are the same connection.
 
 Deployed at `/opt/ytm-media/server.mjs`, unit at `/etc/systemd/system/ytm-media.service`,
 listening on `0.0.0.0:8080`. Requests must carry the secret path prefix that is
-also in `MEDIA_PROXY` in `index.js`.
+also in `MEDIA_PROXY_HOME` / `MEDIA_PROXY_VPS` in `index.js`.
+
+## Running it on the home machine instead
+
+Licensed art tracks — the `- Topic` uploads that are most of YouTube Music —
+return `UNPLAYABLE` from every datacenter and VPN address, with or without a
+signed-in cookie and with or without a PO token. A residential connection gets a
+playable URL for the same request, so the Worker asks the home box first and
+falls back to this VPS (which still serves ordinary video tracks) when it is off.
+
+On the laptop, `run-local.cmd` starts the same `server.mjs` with no WARP binding
+and no yt-dlp, and a tunnel publishes it:
+
+```
+cloudflared tunnel --url http://127.0.0.1:8080
+```
+
+A quick tunnel prints a fresh `*.trycloudflare.com` hostname every start, so that
+hostname is a constant in `index.js` and has to be updated (or replaced by a
+named tunnel on a domain) whenever the tunnel restarts. `run-local.cmd` leaves
+`YTM_WARP_LOCAL_ADDR` empty, which is why `ytdlpUrl` only passes
+`--source-address` when one is set.
 
 ## WARP egress
 

@@ -315,7 +315,8 @@ async function servesWholeFile(url, ua, total) {
 
 function ytdlpUrl(videoId, format) {
   const args = [
-    '--source-address', WARP_LOCAL_ADDR,
+    // Only meaningful on the VPS; a laptop has no tunnel to bind.
+    ...(WARP_LOCAL_ADDR ? ['--source-address', WARP_LOCAL_ADDR] : []),
     '-f', format,
     '-g',
     '--no-warnings',
