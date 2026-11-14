@@ -1,6 +1,6 @@
 {
   "name": "eclipse-ytmusic",
-  "version": "2.10.0",
+  "version": "2.10.2",
   "description": "YouTube Music addon for Eclipse — powered by Cloudflare Workers",
   "main": "index.js",
   "scripts": {

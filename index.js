@@ -1,5 +1,30 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.10.0 — dead-client purge + stream URL cache
+// author: ricky | version: 2.10.2 — proxied bytes, no caching
+//
+// WHAT CHANGED IN 2.10.2 — nothing is cached anymore. 2.10.1 (below) is the
+// change that actually made playback possible.
+//
+// WHAT CHANGED IN 2.10.1 — the actual cause of "no playback"
+// - A googlevideo URL is signed for the IP address that asked for it: `ip` is
+//   in the URL's sparams list and is covered by the signature. Rewriting the
+//   ip= parameter and re-fetching returns 403 text/plain (verified).
+// - So the old /stream handed Eclipse a URL minted for the WORKER's Cloudflare
+//   IP, while the phone fetched it from the phone's IP. Different IP, invalid
+//   signature, 403 — playback could never work no matter which client resolved
+//   the track or how many times the fallback chain ran.
+// - /stream now returns a URL on this Worker (/audio/<id>), and the Worker is
+//   both the minter and the fetcher, so the bound IP always matches. The same
+//   applies to the optional video (/video/<id>).
+// - Because Cloudflare may egress a second request through a different
+//   address, a 403 from the CDN is treated as "signature/IP mismatch": the
+//   cached URL is dropped, the track is re-resolved once, and the fetch is
+//   retried. A persistent 403 still surfaces as an error instead of silence.
+// - The stream reply now also carries the routing fields Eclipse uses to pick
+//   a playback engine before the first byte (codec/container/manifest/
+//   expiresAt), so the client doesn't have to probe the file.
+// - Nothing is cached. Every request resolves fresh; no track, URL or audio
+//   byte is stored anywhere. The tradeoff is one player call per audio
+//   request instead of one per track.
 //
 // WHAT CHANGED IN 2.10.0 (and why the "10 bot errors per stream" are gone)
 // - The /stream chain is now 3 clients, not 9. Live probing showed that 7 of
@@ -12,9 +37,8 @@
 //   Those attempts were the ~10 error lines per stream in `wrangler tail`:
 //   one genuine failure fanned out into 8 more player calls, plus 3 more from
 //   the old fetchVideoInfo() best-effort video probe.
-// - Resolved stream URLs are cached (Upstash + per-isolate memory) until the
-//   URL's own expire= timestamp. Replaying a track now costs ZERO player
-//   calls. This is the main reason other YTM frontends feel instant.
+// - (2.10.0 briefly cached resolved URLs; that cache was removed in 2.10.2 on
+//   request — nothing is stored now, every request resolves fresh.)
 // - Video is derived from the same player response that resolved the audio,
 //   so the extra player calls fetchVideoInfo() used to make are gone.
 // - A client that answers with a bot check is skipped for 2 minutes instead of
@@ -704,43 +728,19 @@ function buildVideoInfo(sd) {
   return { url: best.url, mimeType: 'video/mp4', muxed: true, width: best.width || 0, height: best.height, renditions };
 }
 
-// ── Resolved-URL cache ──────────────────────────────────────────────────
-// Two tiers: an in-isolate Map (free) and Upstash (shared across isolates).
-// Entries expire on YouTube's own timestamp, so a cached URL is always one the
-// CDN still accepts — that is why replaying a track makes zero API calls.
-const STREAM_CACHE_L1 = new Map();
-const L1_MAX_ENTRIES = 500;
+// NO CACHING. Every /stream and every /audio request resolves the track
+// fresh against YouTube. The only thing kept between requests is the visitor
+// ID (see getVisitorData), which is an anonymous session identifier, not
+// track data.
+//
+// Note on cost: a googlevideo URL is signed for the IP that minted it, so the
+// Worker has to mint one for itself before it can fetch the bytes. Without a
+// cache that means one player call per audio request (and per seek, since a
+// seek is another Range request).
 
 function urlExpirySeconds(url) {
   const m = /[?&]expire=(\d+)/.exec(url || '');
   return m ? parseInt(m[1], 10) : Math.floor(Date.now() / 1000) + 3600;
-}
-async function getCachedStream(env, trackId) {
-  const now = Math.floor(Date.now() / 1000);
-  const mem = STREAM_CACHE_L1.get(trackId);
-  if (mem && mem.expiresAt > now + 60) return mem.result;
-  if (mem) STREAM_CACHE_L1.delete(trackId);
-  const raw = await upstashCmd(env, 'GET', `ytm:stream:${trackId}`);
-  if (!raw || typeof raw !== 'string') return null;
-  try {
-    const entry = JSON.parse(raw);
-    if (entry?.result?.url && entry.expiresAt > now + 60) {
-      STREAM_CACHE_L1.set(trackId, entry);
-      return entry.result;
-    }
-  } catch {}
-  return null;
-}
-async function setCachedStream(env, trackId, result) {
-  if (!result?.url) return;
-  const expiresAt = urlExpirySeconds(result.url);
-  const now = Math.floor(Date.now() / 1000);
-  const ttl = Math.min(Math.max(expiresAt - now - 60, 0), 21600);
-  if (ttl < 60) return;
-  if (STREAM_CACHE_L1.size >= L1_MAX_ENTRIES) STREAM_CACHE_L1.clear();
-  const entry = { result, expiresAt };
-  STREAM_CACHE_L1.set(trackId, entry);
-  await upstashCmd(env, 'SET', `ytm:stream:${trackId}`, JSON.stringify(entry), 'EX', ttl);
 }
 
 async function resolveStream(kind, trackId, env, userToken) {
@@ -748,25 +748,20 @@ async function resolveStream(kind, trackId, env, userToken) {
   const sd = data?.streamingData || {};
   const video = buildVideoInfo(sd);
   const best = pickBestAudio(sd);
-  if (best) {
-    const result = { url: best.url, format: 'm4a', quality: 'native' };
-    if (video) result.video = video;
-    return result;
-  }
-  if (sd.hlsManifestUrl) {
-    const result = { url: sd.hlsManifestUrl, format: 'hls', quality: 'auto' };
-    if (video) result.video = video;
-    return result;
-  }
-  throw new PlayerError(`${PLAYER_CLIENTS[kind].label}: no usable format`);
+  const url = best?.url || sd.hlsManifestUrl;
+  if (!url) throw new PlayerError(`${PLAYER_CLIENTS[kind].label}: no usable format`);
+  return {
+    url,
+    format: best ? 'm4a' : 'hls',
+    quality: best ? 'native' : 'auto',
+    expiresAt: urlExpirySeconds(url),
+    video: video || null,
+  };
 }
 
-async function handleStream(trackId, env, userToken) {
-  const cached = await getCachedStream(env, trackId);
-  if (cached) return cached;
-
+// Try the live clients in order, honouring the bot cooldown.
+async function resolveTrack(trackId, env, userToken) {
   const kinds = ['android', 'androidvr', 'ios'];
-  // Skip clients that are cooling down, unless every one of them is.
   const available = kinds.filter(k => !clientCoolingDown(PLAYER_CLIENTS[k].label));
   const order = available.length ? available : kinds;
 
@@ -777,10 +772,9 @@ async function handleStream(trackId, env, userToken) {
     // calls from one Worker IP with no spacing is itself a machine pattern.
     if (i > 0) await new Promise(r => setTimeout(r, 150 + Math.floor(Math.random() * 250)));
     try {
-      const result = await resolveStream(kind, trackId, env, userToken);
+      const entry = await resolveStream(kind, trackId, env, userToken);
       console.log(LOG_PREFIX, `${PLAYER_CLIENTS[kind].label} resolved ${trackId}`);
-      await setCachedStream(env, trackId, result);
-      return result;
+      return entry;
     } catch (e) {
       lastError = e;
       if (e.botBlocked) {
@@ -793,39 +787,119 @@ async function handleStream(trackId, env, userToken) {
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}${lastError ? ' — ' + lastError.message : ''}`);
 }
 
-async function proxyDownload(trackId, incomingRequest, env, userToken) {
-  // Reuse a resolved URL (and its cache entry) when we already have one.
-  let cdnUrl = null;
-  const cached = await getCachedStream(env, trackId);
-  if (cached?.format === 'm4a' && cached.url) cdnUrl = cached.url;
-  if (!cdnUrl) {
-    const data = await playerRequest('android', trackId, env, userToken);
-    const best = pickBestAudio(data?.streamingData);
-    if (!best) throw new Error(`${LOG_PREFIX} No downloadable audio for ${trackId}`);
-    cdnUrl = best.url;
-    await setCachedStream(env, trackId, { url: best.url, format: 'm4a', quality: 'native' });
+// ── /stream reply ───────────────────────────────────────────────────────
+// IMPORTANT: the CDN URL is signed for the IP that minted it (sparams includes
+// ip, and the signature covers it), so handing it to a listener's phone yields
+// 403. Both audio and video are therefore served from this Worker instead.
+function buildStreamResponse(trackId, entry, origin) {
+  const base = origin || '';
+  if (entry.format === 'hls') {
+    // HLS segments are on the CDN too and cannot be proxied without rewriting
+    // the playlist, so this path only exists as a fallback.
+    return {
+      url: entry.url,
+      format: 'hls',
+      quality: entry.quality || 'auto',
+      codec: 'aac',
+      container: 'fmp4',
+      manifest: 'hls',
+      expiresAt: entry.expiresAt,
+    };
   }
-  const reqHeaders = {
-    'User-Agent': ANDROID_NATIVE_UA, 'Accept': '*/*', 'Accept-Language': 'en-US,en;q=0.9',
-    'Origin': 'https://music.youtube.com', 'Referer': 'https://music.youtube.com/',
+  const body = {
+    url: `${base}/audio/${trackId}`,
+    format: 'm4a',
+    quality: entry.quality || 'native',
+    codec: 'aac',
+    container: 'mp4',
+    manifest: 'none',
+    expiresAt: entry.expiresAt,
   };
-  if (env?.YT_COOKIE) reqHeaders['Cookie'] = env.YT_COOKIE;
+  if (entry.video?.url) {
+    body.video = {
+      url: `${base}/video/${trackId}`,
+      mimeType: 'video/mp4',
+      muxed: true,
+      width: entry.video.width || 0,
+      height: entry.video.height || 0,
+    };
+  }
+  return body;
+}
+
+async function handleStream(trackId, env, userToken, origin) {
+  const entry = await resolveTrack(trackId, env, userToken);
+  return buildStreamResponse(trackId, entry, origin);
+}
+
+// ── Media proxy ─────────────────────────────────────────────────────────
+// Fetches the bytes with the same Worker that minted the URL, so the ip= in
+// the signature always matches the connection that opens it.
+const CDN_HEADERS = {
+  'User-Agent': ANDROID_NATIVE_UA,
+  'Accept': '*/*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Origin': 'https://music.youtube.com',
+  'Referer': 'https://music.youtube.com/',
+};
+
+async function proxyMedia(trackId, kind, incomingRequest, env, userToken) {
+  const wantsVideo = kind === 'video';
+  const method = incomingRequest.method === 'HEAD' ? 'HEAD' : 'GET';
   const range = incomingRequest.headers.get('range');
-  if (range) reqHeaders['Range'] = range;
-  const upstream = await fetch(cdnUrl, { headers: reqHeaders });
-  const upstreamCT = upstream.headers.get('content-type') || '';
-  if (!upstream.ok && upstream.status !== 206) throw new Error(`${LOG_PREFIX} CDN ${upstream.status} for ${trackId}`);
-  if (!upstreamCT.includes('audio') && !upstreamCT.includes('octet-stream') && !upstreamCT.includes('video')) {
-    const preview = await upstream.text();
-    throw new Error(`${LOG_PREFIX} CDN returned non-audio content-type "${upstreamCT}" — body: ${preview.slice(0, 200)}`);
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const entry = await resolveTrack(trackId, env, userToken);
+    const target = wantsVideo ? entry.video?.url : entry.url;
+    if (!target) {
+      if (wantsVideo) {
+        // The cached resolution came from a client that had no muxed video;
+        // re-resolve once in case another client does.
+        continue;
+      }
+      throw new Error(`${LOG_PREFIX} no ${kind} source for ${trackId}`);
+    }
+
+    const headers = { ...CDN_HEADERS };
+    if (env?.YT_COOKIE) headers.Cookie = env.YT_COOKIE;
+    if (range) headers.Range = range;
+
+    const upstream = await fetch(target, { method, headers });
+
+    // 403 from the CDN means the signature was minted for a different egress
+    // address than this fetch used. Drop the cache and mint again.
+    if (upstream.status === 403 || upstream.status === 401) {
+      console.log(LOG_PREFIX, `${kind} ${upstream.status} for ${trackId} — re-minting URL (attempt ${attempt + 1})`);
+      continue;
+    }
+    if (!upstream.ok && upstream.status !== 206) {
+      throw new Error(`${LOG_PREFIX} CDN ${upstream.status} for ${trackId}`);
+    }
+
+    const out = {
+      'content-type': wantsVideo ? 'video/mp4' : 'audio/mp4',
+      'accept-ranges': 'bytes',
+      'access-control-allow-origin': '*',
+      'access-control-allow-methods': 'GET, HEAD, OPTIONS',
+      'access-control-allow-headers': 'Range',
+      'access-control-expose-headers': 'Content-Range, Content-Length, Accept-Ranges',
+      'cache-control': 'private, max-age=3600',
+    };
+    for (const h of ['content-range', 'content-length']) {
+      const v = upstream.headers.get(h);
+      if (v) out[h] = v;
+    }
+    return new Response(method === 'HEAD' ? null : upstream.body, { status: upstream.status, headers: out });
   }
-  const resHeaders = {
-    'content-type': 'audio/mp4', 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, OPTIONS',
-    'cache-control': 'no-store', 'content-disposition': `attachment; filename="${trackId}.m4a"`,
-  };
-  if (upstream.headers.get('content-range')) resHeaders['content-range'] = upstream.headers.get('content-range');
-  if (upstream.headers.get('accept-ranges')) resHeaders['accept-ranges'] = upstream.headers.get('accept-ranges');
-  return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
+  throw new Error(`${LOG_PREFIX} CDN kept rejecting the signed URL for ${trackId}`);
+}
+
+async function proxyDownload(trackId, incomingRequest, env, userToken) {
+  const res = await proxyMedia(trackId, 'audio', incomingRequest, env, userToken);
+  const headers = new Headers(res.headers);
+  headers.set('content-disposition', `attachment; filename="${trackId}.m4a"`);
+  headers.set('cache-control', 'no-store');
+  return new Response(res.body, { status: res.status, headers });
 }
 
 function extractSecondaryTracks(data, fallbackArtist, fallbackAlbum, fallbackArtwork) {
@@ -983,7 +1057,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.10.0', description: v.description,
+    id: v.id, name: v.name, version: '2.10.2', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
@@ -1221,7 +1295,13 @@ if (ECLIPSE_GATED_PREFIXES.some((p) => rest === p || rest.startsWith(p + "/"))) 
   if (!eclipseClaims) return eclipseAccessDeniedResponse();
 }
   if (rest === '/search') return jsonRes(await handleSearch(q, env, userToken, effectiveMode));
-  if (rest.startsWith('/stream/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleStream(id, env, userToken)); }
+  if (rest.startsWith('/stream/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleStream(id, env, userToken, env?.PUBLIC_BASE_URL || url.origin)); }
+  // Media bytes are served by this Worker, not by googlevideo: the signed CDN
+  // URL is only valid from the IP that minted it. These two are deliberately
+  // not behind the Eclipse gate — a player fetching an audio URL does not send
+  // the addon's access header.
+  if (rest.startsWith('/audio/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return await proxyMedia(id, 'audio', request, env, userToken); }
+  if (rest.startsWith('/video/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return await proxyMedia(id, 'video', request, env, userToken); }
   if (rest.startsWith('/download/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return await proxyDownload(id, request, env, userToken); }
   if (rest.startsWith('/album/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleAlbum(id, env, userToken)); }
   if (rest.startsWith('/artist/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleArtist(id, env, userToken, effectiveMode)); }
