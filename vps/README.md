@@ -5,16 +5,60 @@ rotate their egress address between subrequests, so a Worker that mints a URL
 and then fetches it intermittently gets 403. This service runs on a machine with
 one fixed address, so the mint and the fetch are the same connection.
 
-    systemctl status ytm-media
+    systemctl status ytm-media wg-quick@wgcf
     journalctl -u ytm-media -f
+    curl -s http://127.0.0.1:8080/<secret>/health
 
 Deployed at `/opt/ytm-media/server.mjs`, unit at `/etc/systemd/system/ytm-media.service`,
 listening on `0.0.0.0:8080`. Requests must carry the secret path prefix that is
 also in `MEDIA_PROXY` in `index.js`.
 
-Optional: put a signed-in YouTube cookie in the unit as
-`Environment=YTM_COOKIE=...` to get past the "confirm you're not a bot"
-challenge that datacenter addresses receive.
+## WARP egress
 
-To remove it entirely: `sudo systemctl disable --now ytm-media` and delete
-`/opt/ytm-media` plus the unit file.
+The VPS's own OVH address is flagged by YouTube: every player call comes back
+`LOGIN_REQUIRED: Sign in to confirm you're not a bot`, which is what made tracks
+load and then skip. So YouTube traffic goes out through Cloudflare WARP instead.
+
+`wg-quick@wgcf` (`/etc/wireguard/wgcf.conf`) is a **split** setup: `Table = off`
+plus a policy rule for source `172.16.0.2` only. The box keeps its normal route;
+anything that binds that source address goes through WARP. The service binds it
+for every YouTube request (`YTM_WARP_LOCAL_ADDR`), so player calls and media
+fetches always leave from the same address, and the `ip=` signed into the media
+URL matches the address that fetches it.
+
+If WARP is down the service retries once on the normal route, so it degrades
+instead of breaking. To go back to a direct connection, set
+`Environment=YTM_WARP_LOCAL_ADDR=` (empty) in
+`/etc/systemd/system/ytm-media.service.d/warp.conf`.
+
+## Client order and the limited-URL probe
+
+`VISIONOS` is asked first: no token, plain progressive URLs, whole file. `IOS`,
+`ANDROID_VR`, `ANDROID` and `TVHTML5` follow for videos it refuses.
+
+YouTube hands out two kinds of media URL. An ordinary one serves the whole
+file. A "limited" one serves about 1 MiB and then 403s — which is what made
+tracks stall halfway. Before accepting a URL the service asks for its last byte;
+a real URL answers `206`, a limited one answers `403`, and a limited URL is
+dropped while the next client is asked instead. No PO token is needed for the
+clients above.
+
+If every client is challenged, the service falls back to `yt-dlp` (installed at
+`~/.local/bin/yt-dlp`, run with `--source-address` so it also uses WARP) and
+applies the same probe. Per-track URLs are memoised in RAM for five minutes so a
+seek does not cost another player call; nothing is written to disk.
+
+Optional: put a signed-in YouTube cookie in the unit as
+`Environment=YTM_COOKIE=...` if the challenge ever comes back.
+
+## Unused extra
+
+`ytm-pot` (a localhost PO-token server at `/opt/bgutil`) was used while working
+out which clients need tokens. None of the clients above do, so it is installed
+but stopped. `sudo systemctl start ytm-pot` brings it back if that changes.
+
+## Removing it
+
+    sudo systemctl disable --now ytm-media wg-quick@wgcf
+    sudo rm -rf /opt/ytm-media /etc/wireguard/wgcf.conf /etc/systemd/system/ytm-media.service
+    sudo rm -rf /etc/systemd/system/ytm-media.service.d
