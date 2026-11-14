@@ -1,5 +1,11 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.14.0 — media from the home laptop
+// author: ricky | version: 2.15.0 — stable home endpoint
+//
+// WHAT CHANGED IN 2.15.0 — the home box is reached over an SSH reverse tunnel on
+// this VPS (port 8081) instead of a Cloudflare quick tunnel, so its address is
+// permanent and a reboot needs no edit. The circuit breaker that parked the home
+// box for a minute after one dropped connection is gone: since only the home box
+// can resolve a licensed art track, that pinned every song into a blackout.
 //
 // WHAT CHANGED IN 2.14.0 — licensed art tracks (the "- Topic" uploads that are
 // almost every song in YouTube Music) answer UNPLAYABLE from every address this
@@ -895,15 +901,12 @@ async function warmTrack(trackId) {
         method: 'POST',
         signal: AbortSignal.timeout(6000),
       });
-      if (!res.ok) {
-        if (base === MEDIA_PROXY_HOME) markHomeDown();
-        continue;
-      }
+      if (!res.ok) continue;
       const meta = await res.json().catch(() => null);
-      if (base === MEDIA_PROXY_HOME && meta && meta.ok === false) return null;
+      if (meta && meta.ok === false) return null;
       return meta && meta.ok ? meta : null;
     } catch {
-      if (base === MEDIA_PROXY_HOME) markHomeDown();
+      // Try the next box.
     }
   }
   return null;
@@ -935,21 +938,23 @@ const CDN_HEADERS = {
 // request from the home connection and from the VPS. The VPS stays second: it
 // still resolves ordinary video tracks, so a laptop that is asleep degrades to
 // yesterday's behaviour instead of breaking playback outright.
-const MEDIA_PROXY_HOME = 'https://cinema-productive-limit-brian.trycloudflare.com/k7f2q9w4e1r8t5y3u6i0o2p4a6s8d0g2';
+// Port 8081 on this same box is an SSH reverse tunnel to the laptop (the laptop
+// runs `ssh -R 0.0.0.0:8081:127.0.0.1:8080`), so this address never changes and
+// nothing has to be edited when the machine reboots. When the laptop is off the
+// forwarded port disappears with the SSH session, so the request fails in
+// milliseconds instead of hanging. A quick tunnel was tried first and rejected:
+// its hostname changes on every restart and it drops connections often enough to
+// make playback flaky.
+const MEDIA_PROXY_HOME = 'http://15-204-247-1.sslip.io:8081/k7f2q9w4e1r8t5y3u6i0o2p4a6s8d0g2';
 const MEDIA_PROXY_VPS = 'http://15-204-247-1.sslip.io:8080/k7f2q9w4e1r8t5y3u6i0o2p4a6s8d0g2';
 
-// When the laptop is off, the tunnel refuses the connection fast and then so
-// does every following request. One minute of silence keeps a sleeping machine
-// from costing a timeout on each player action.
-let homeDownUntil = 0;
-const HOME_COOLDOWN_MS = 60 * 1000;
-
-function markHomeDown() {
-  homeDownUntil = Date.now() + HOME_COOLDOWN_MS;
-}
-
+// No circuit breaker here on purpose. One was tried and it was the bug: a single
+// dropped tunnel connection parked the home box for a minute, and since only the
+// home box can resolve a licensed art track, every song in the app then failed
+// with nothing to retry against. A dead tunnel refuses the connection in
+// milliseconds, which is cheap enough to pay on every request.
 function mediaProxyOrder() {
-  return Date.now() >= homeDownUntil ? [MEDIA_PROXY_HOME, MEDIA_PROXY_VPS] : [MEDIA_PROXY_VPS];
+  return [MEDIA_PROXY_HOME, MEDIA_PROXY_VPS];
 }
 
 async function proxyMedia(trackId, kind, incomingRequest, env, userToken) {
@@ -960,6 +965,8 @@ async function proxyMedia(trackId, kind, incomingRequest, env, userToken) {
   let failure = null;
   for (const base of mediaProxyOrder()) {
     try {
+      // Deliberately no timeout: this fetch is the audio stream itself, and an
+      // abort signal would cut playback off mid-track.
       const res = await fetch(`${base}/${kind}/${encodeURIComponent(trackId)}`, {
         method,
         headers: clientRange ? { range: clientRange } : {},
@@ -968,12 +975,10 @@ async function proxyMedia(trackId, kind, incomingRequest, env, userToken) {
         upstream = res;
         break;
       }
-      // The box answered, so it is awake — but it cannot serve this track. Try
-      // the other one before giving up, since only home can serve art tracks.
+      // This box answered but cannot serve the track; ask the other one before
+      // giving up, since only home can serve a licensed art track.
       failure = res;
-      if (base === MEDIA_PROXY_HOME) continue;
     } catch (e) {
-      if (base === MEDIA_PROXY_HOME) markHomeDown();
       failure = failure || e;
     }
   }
@@ -1179,7 +1184,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.14.0', description: v.description,
+    id: v.id, name: v.name, version: '2.15.0', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],

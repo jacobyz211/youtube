@@ -21,18 +21,26 @@ signed-in cookie and with or without a PO token. A residential connection gets a
 playable URL for the same request, so the Worker asks the home box first and
 falls back to this VPS (which still serves ordinary video tracks) when it is off.
 
-On the laptop, `run-local.cmd` starts the same `server.mjs` with no WARP binding
-and no yt-dlp, and a tunnel publishes it:
+Double-click `start-proxy.cmd` (a desktop shortcut points at it) and it starts the
+proxy plus an SSH reverse tunnel to this VPS:
 
 ```
-cloudflared tunnel --url http://127.0.0.1:8080
+ssh -N -R 0.0.0.0:8081:127.0.0.1:8080 vps
 ```
 
-A quick tunnel prints a fresh `*.trycloudflare.com` hostname every start, so that
-hostname is a constant in `index.js` and has to be updated (or replaced by a
-named tunnel on a domain) whenever the tunnel restarts. `run-local.cmd` leaves
-`YTM_WARP_LOCAL_ADDR` empty, which is why `ytdlpUrl` only passes
-`--source-address` when one is set.
+so the permanent address is `http://15-204-247-1.sslip.io:8081/<secret>`, which is
+`MEDIA_PROXY_HOME` in `index.js`. Nothing needs editing after a reboot — just
+click the shortcut again. It is deliberately not started at login.
+
+`sshd` needs `GatewayPorts clientspecified` (in
+`/etc/ssh/sshd_config.d/99-ytm-gatewayports.conf`) for that reverse forward to
+bind the public interface instead of loopback. Cleanup on the VPS: only port 8081
+forwards to the laptop, 8080 stays the VPS's own service.
+
+A Cloudflare quick tunnel was used first and abandoned: its hostname changes on
+every restart and it drops connections often enough that playback stuttered.
+`run-local.cmd` still exists for running the proxy in a plain console;
+`start-proxy.cmd` is the normal way.
 
 ## WARP egress
 

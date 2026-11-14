@@ -127,7 +127,78 @@ const CLIENTS = [
       gl: 'US',
     },
   },
+  // The following five are the clients the Worker used to carry one function
+  // each for. None of them is the fastest, but a track that the Apple clients
+  // refuse is sometimes answered by one of these, and the race below means
+  // having them costs no waiting.
+  {
+    name: 'ANDROID_MUSIC',
+    clientId: '21',
+    ua: 'com.google.android.apps.youtube.music/7.27.0 (Linux; U; Android 14) gzip',
+    ctx: {
+      clientName: 'ANDROID_MUSIC',
+      clientVersion: '7.27.0',
+      androidSdkVersion: 34,
+      osName: 'Android',
+      osVersion: '14',
+      hl: 'en',
+      gl: 'US',
+    },
+  },
+  {
+    name: 'TVHTML5_EMBEDDED',
+    clientId: '85',
+    ua: 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)',
+    needsThirdParty: true,
+    ctx: {
+      clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+      clientVersion: '2.0',
+      hl: 'en',
+      gl: 'US',
+    },
+  },
+  {
+    name: 'MWEB',
+    clientId: '2',
+    ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1',
+    ctx: {
+      clientName: 'MWEB',
+      clientVersion: '2.20260810.01.00',
+      hl: 'en',
+      gl: 'US',
+    },
+  },
+  {
+    name: 'WEB_CREATOR',
+    clientId: '62',
+    ua: WEB_UA,
+    ctx: {
+      clientName: 'WEB_CREATOR',
+      clientVersion: '1.20260530.01.00',
+      clientScreen: 'EMBED',
+      hl: 'en',
+      gl: 'US',
+    },
+  },
+  {
+    name: 'WEB_EMBEDDED',
+    clientId: '56',
+    ua: WEB_UA,
+    needsThirdParty: true,
+    ctx: {
+      clientName: 'WEB_EMBEDDED_PLAYER',
+      clientVersion: '2.20260530.01.00',
+      hl: 'en',
+      gl: 'US',
+    },
+  },
 ];
+
+// Clients are started this far apart and the first one to produce a URL that
+// actually streams is the one used. Firing one, waiting for it to fail, then
+// firing the next is why a cold track could sit there: the answer was often the
+// fourth client along.
+const CLIENT_STAGGER_MS = 120;
 
 // Per-track, in-RAM only. A seek re-uses the URL for a few minutes instead of
 // spending another player call. Nothing touches disk, and a URL the CDN rejects
@@ -356,6 +427,121 @@ async function fromYtDlp(videoId) {
   return null;
 }
 
+// One client's whole attempt: player call, pick the audio, prove the URL streams,
+// and find the muxed rendition the player can show as video.
+async function attemptClient(client, videoId) {
+  try {
+    const sd = await player(client, videoId);
+    const audio = rankAudio(sd.adaptiveFormats || [])[0];
+    if (!audio) throw new Error('no audio format');
+    const total = Number(audio.contentLength) || null;
+
+    if (!(await servesWholeFile(audio.url, client.ua, total)).ok) {
+      console.log(new Date().toISOString(), 'limited url', videoId, client.name);
+      return { limited: true, err: `${client.name} limited url` };
+    }
+
+    // Eclipse plays video only when /stream offers it, and it wants one file with
+    // picture AND sound ("muxed"). VISIONOS and IOS answer with adaptive formats
+    // only, which are video-only, so a track that has video may cost one more
+    // player call to ANDROID, which still returns the muxed 360p rendition.
+    const hasVideo = (sd.adaptiveFormats || []).some((f) => String(f.mimeType || '').startsWith('video/'));
+    let muxed = (sd.formats || [])
+      .filter((f) => f.url && String(f.mimeType || '').startsWith('video/mp4'))
+      .sort((a, b) => (b.height || 0) - (a.height || 0))[0] || null;
+    let muxedUa = client.ua;
+
+    // A muxed format taken straight from this client's response often has no
+    // contentLength, and without a length the player cannot seek the video.
+    if (muxed && !muxed.contentLength) {
+      const own = await servesWholeFile(muxed.url, muxedUa, null);
+      if (own.total) muxed.contentLength = own.total;
+    }
+
+    if (!muxed && hasVideo) {
+      const android = CLIENTS.find((c) => c.name === 'ANDROID');
+      try {
+        const sd2 = await player(android, videoId);
+        const cand = (sd2.formats || []).find((f) => f.url && String(f.mimeType || '').startsWith('video/mp4'));
+        const probe = cand ? await servesWholeFile(cand.url, android.ua, Number(cand.contentLength) || null) : null;
+        if (cand && probe.ok) {
+          muxed = cand;
+          muxedUa = android.ua;
+          if (probe.total) cand.contentLength = probe.total;
+        } else if (cand) {
+          console.log(new Date().toISOString(), 'muxed video rejected', videoId);
+        }
+      } catch (e) {
+        console.log(new Date().toISOString(), 'no muxed video', videoId, e.message.slice(0, 60));
+      }
+    }
+
+    return {
+      val: {
+        audio: audio.url,
+        video: muxed ? muxed.url : null,
+        videoUa: muxedUa,
+        videoWidth: (muxed && muxed.width) || null,
+        videoHeight: (muxed && muxed.height) || null,
+        // The muxed rendition is a different file with a different length, so
+        // it needs its own total for range maths.
+        videoTotal: (muxed && Number(muxed.contentLength)) || null,
+        ua: client.ua,
+        total,
+        client: client.name,
+      },
+    };
+  } catch (e) {
+    console.log(new Date().toISOString(), 'resolve failed', videoId, e.message);
+    // A challenged client usually means the session token has gone stale, so
+    // make the next attempt fetch a fresh one.
+    if (e.message.includes('LOGIN_REQUIRED')) visitorData = '';
+    return { err: e.message };
+  }
+}
+
+// Starts a client every CLIENT_STAGGER_MS and takes the first answer that can
+// actually stream. Everything still in flight when a winner appears is ignored,
+// so the wait is set by the fastest client rather than by the slowest failure.
+async function raceClients(videoId) {
+  const errors = [];
+  let sawLimited = false;
+  let settled = false;
+  let outstanding = 0;
+  let launchTimer = null;
+  let settle;
+  const won = new Promise((r) => (settle = r));
+
+  const finish = (val) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(launchTimer);
+    settle(val);
+  };
+
+  const launch = (i) => {
+    if (settled || i >= CLIENTS.length) return;
+    const client = CLIENTS[i];
+    outstanding++;
+    attemptClient(client, videoId).then((r) => {
+      outstanding--;
+      if (settled) return;
+      if (r.limited) sawLimited = true;
+      if (r.val) {
+        finish(r.val);
+        return;
+      }
+      if (r.err) errors.push(r.err);
+      if (i + 1 >= CLIENTS.length && outstanding === 0) finish(null);
+    });
+    launchTimer = setTimeout(() => launch(i + 1), CLIENT_STAGGER_MS);
+  };
+
+  launch(0);
+  const val = await won;
+  return { val, sawLimited, roundErrors: errors };
+}
+
 async function resolve(videoId) {
   const cached = memoGet(videoId);
   if (cached) return cached;
@@ -369,73 +555,12 @@ async function resolve(videoId) {
   for (let round = 0; round < 3; round++) {
     if (round > 0) await sleep(300 * round);
 
-    let sawLimited = false;
-    for (const client of CLIENTS) {
-      try {
-        const sd = await player(client, videoId);
-        const audio = rankAudio(sd.adaptiveFormats || [])[0];
-        if (!audio) throw new Error('no audio format');
-        const total = Number(audio.contentLength) || null;
-
-        if (!(await servesWholeFile(audio.url, client.ua, total)).ok) {
-          errors.push(`${client.name} limited url`);
-          sawLimited = true;
-          console.log(new Date().toISOString(), 'limited url', videoId, client.name, round);
-          continue;
-        }
-
-        // Eclipse plays video only when /stream offers it, and it wants one file
-        // with picture AND sound ("muxed"). VISIONOS and IOS answer with
-        // adaptive formats only, which are video-only, so a track that has video
-        // costs one extra player call to ANDROID, which still returns the muxed
-        // 360p rendition. Tracks with no video formats at all cost nothing.
-        const hasVideo = (sd.adaptiveFormats || []).some((f) => String(f.mimeType || '').startsWith('video/'));
-        let muxed = (sd.formats || [])
-          .filter((f) => f.url && String(f.mimeType || '').startsWith('video/mp4'))
-          .sort((a, b) => (b.height || 0) - (a.height || 0))[0] || null;
-        let muxedUa = client.ua;
-
-        if (!muxed && hasVideo) {
-          const android = CLIENTS.find((c) => c.name === 'ANDROID');
-          try {
-            const sd2 = await player(android, videoId);
-            const cand = (sd2.formats || []).find((f) => f.url && String(f.mimeType || '').startsWith('video/mp4'));
-            const probe = cand ? await servesWholeFile(cand.url, android.ua, Number(cand.contentLength) || null) : null;
-            if (cand && probe.ok) {
-              muxed = cand;
-              muxedUa = android.ua;
-              if (probe.total) cand.contentLength = probe.total;
-            } else if (cand) {
-              console.log(new Date().toISOString(), 'muxed video rejected', videoId);
-            }
-          } catch (e) {
-            console.log(new Date().toISOString(), 'no muxed video', videoId, e.message.slice(0, 60));
-          }
-        }
-
-        const val = {
-          audio: audio.url,
-          video: muxed ? muxed.url : null,
-          videoUa: muxedUa,
-          videoWidth: (muxed && muxed.width) || null,
-          videoHeight: (muxed && muxed.height) || null,
-          // The muxed rendition is a different file with a different length, so
-          // it needs its own total for range maths.
-          videoTotal: (muxed && Number(muxed.contentLength)) || null,
-          ua: client.ua,
-          total,
-          client: client.name,
-        };
-        memoSet(videoId, val);
-        console.log(new Date().toISOString(), client.name, 'resolved', videoId, total || '');
-        return val;
-      } catch (e) {
-        errors.push(e.message);
-        console.log(new Date().toISOString(), 'resolve failed', videoId, e.message);
-        // A challenged client usually means the session token has gone stale, so
-        // make the next attempt fetch a fresh one.
-        if (e.message.includes('LOGIN_REQUIRED')) visitorData = '';
-      }
+    const { val, sawLimited, roundErrors } = await raceClients(videoId);
+    errors.push(...roundErrors);
+    if (val) {
+      memoSet(videoId, val);
+      console.log(new Date().toISOString(), val.client, 'resolved', videoId, val.total || '');
+      return val;
     }
 
     // Nothing was throttled, so the track really is unplayable and another round
