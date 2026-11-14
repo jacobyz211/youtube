@@ -62,13 +62,21 @@ straight through to the player, with `content-length` declared up front. A 403
 partway through a long track is not fatal: the URL is re-minted and the read
 continues from the byte it reached, so the player's connection never breaks.
 
-## Prewarming
+## Prewarming and video
 
-`/stream` fires `/<secret>/prewarm/<id>`, which starts the resolve and answers
-`202` immediately. The player then asks for `/audio/<id>` a moment later and
-finds the URL already done, because both share the in-flight map — it is the
-same resolve, not a second player call. This is what removed the second of dead
-time between tapping a track and hearing it.
+`/stream` calls `/<secret>/prewarm/<id>` and waits for it. It returns metadata
+only — `{ok, hasVideo, width, height, total, videoTotal}` — never the signed
+media URL, which is bound to this address. The player then asks for `/audio/<id>`
+a moment later and finds the URL already done, because both share the in-flight
+map: it is the same resolve, not a second player call.
+
+Eclipse only shows its video toggle for a track whose `/stream` reply carries a
+`video` object, and it wants **one file with picture and sound** (`muxed: true`).
+VISIONOS and IOS return adaptive formats only, which are video-only, so a track
+that has video costs one extra player call to `ANDROID`, which still returns the
+muxed 360p rendition. Tracks without video formats cost nothing extra. That
+rendition is served from `/video/<id>` with its own `content-length` and range
+support, taken from the probe because progressive formats omit `contentLength`.
 
 If every client is challenged, the service falls back to `yt-dlp` (installed at
 `~/.local/bin/yt-dlp`, run with `--source-address` so it also uses WARP) and

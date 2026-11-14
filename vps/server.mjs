@@ -276,18 +276,37 @@ function rankAudio(formats) {
 // requests to another backend, and treating that as a failure threw away good
 // URLs; a network blip is likewise not proof that the URL is limited, and the
 // chunk loop re-mints on a real 403 anyway.
+// Returns the size too: progressive formats often leave contentLength out, and
+// the answer to the last-byte request always carries the real total.
+const sizeFrom = (res) =>
+  Number(/\/(\d+)\s*$/.exec(res.headers['content-range'] || '')?.[1]) ||
+  (res.status === 200 ? Number(res.headers['content-length']) || null : null);
+
 async function servesWholeFile(url, ua, total) {
-  if (!total || total < 1) return true;
   try {
+    let size = total && total > 0 ? total : null;
+
+    // Progressive formats often carry no contentLength, and without a size the
+    // player cannot seek a video. One byte tells us the total.
+    if (!size) {
+      const first = await request(url, { headers: { range: 'bytes=0-0', 'user-agent': ua }, follow: 2, timeout: 10000 });
+      first.stream.resume();
+      size = sizeFrom(first);
+      // A 200 means the host served the whole file and ignores ranges; that is
+      // still playable, it just cannot seek.
+      if (first.status === 200) return { ok: true, total: size };
+      if (!size) return { ok: ![401, 403, 410].includes(first.status), total: null };
+    }
+
     const res = await request(url, {
-      headers: { range: `bytes=${total - 1}-${total - 1}`, 'user-agent': ua },
+      headers: { range: `bytes=${size - 1}-${size - 1}`, 'user-agent': ua },
       follow: 2,
       timeout: 10000,
     });
     res.stream.resume();
-    return ![401, 403, 410].includes(res.status);
+    return { ok: ![401, 403, 410].includes(res.status), total: sizeFrom(res) || size };
   } catch {
-    return true;
+    return { ok: true, total: null };
   }
 }
 
@@ -320,11 +339,12 @@ async function fromYtDlp(videoId) {
       res.stream.resume();
       if (res.status !== 200 && res.status !== 206) continue;
       const total = Number(/\/(\d+)\s*$/.exec(res.headers['content-range'] || '')?.[1]) || null;
-      if (!(await servesWholeFile(audio, WEB_UA, total))) {
+      const probe = await servesWholeFile(audio, WEB_UA, total);
+      if (!probe.ok) {
         console.log(new Date().toISOString(), 'yt-dlp url is limited', videoId);
         continue;
       }
-      return { audio, video: null, ua: WEB_UA, total, client: 'yt-dlp' };
+      return { audio, video: null, ua: WEB_UA, total: probe.total || total, client: 'yt-dlp' };
     } catch (e) {
       console.log(new Date().toISOString(), 'yt-dlp failed', videoId, e.message.split('\n')[0]);
     }
@@ -353,22 +373,51 @@ async function resolve(videoId) {
         if (!audio) throw new Error('no audio format');
         const total = Number(audio.contentLength) || null;
 
-        if (!(await servesWholeFile(audio.url, client.ua, total))) {
+        if (!(await servesWholeFile(audio.url, client.ua, total)).ok) {
           errors.push(`${client.name} limited url`);
           sawLimited = true;
           console.log(new Date().toISOString(), 'limited url', videoId, client.name, round);
           continue;
         }
 
-        // Progressive video is only used by the optional /video route; the addon
-        // itself only ever asks for audio.
-        const video = (sd.formats || [])
+        // Eclipse plays video only when /stream offers it, and it wants one file
+        // with picture AND sound ("muxed"). VISIONOS and IOS answer with
+        // adaptive formats only, which are video-only, so a track that has video
+        // costs one extra player call to ANDROID, which still returns the muxed
+        // 360p rendition. Tracks with no video formats at all cost nothing.
+        const hasVideo = (sd.adaptiveFormats || []).some((f) => String(f.mimeType || '').startsWith('video/'));
+        let muxed = (sd.formats || [])
           .filter((f) => f.url && String(f.mimeType || '').startsWith('video/mp4'))
-          .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+          .sort((a, b) => (b.height || 0) - (a.height || 0))[0] || null;
+        let muxedUa = client.ua;
+
+        if (!muxed && hasVideo) {
+          const android = CLIENTS.find((c) => c.name === 'ANDROID');
+          try {
+            const sd2 = await player(android, videoId);
+            const cand = (sd2.formats || []).find((f) => f.url && String(f.mimeType || '').startsWith('video/mp4'));
+            const probe = cand ? await servesWholeFile(cand.url, android.ua, Number(cand.contentLength) || null) : null;
+            if (cand && probe.ok) {
+              muxed = cand;
+              muxedUa = android.ua;
+              if (probe.total) cand.contentLength = probe.total;
+            } else if (cand) {
+              console.log(new Date().toISOString(), 'muxed video rejected', videoId);
+            }
+          } catch (e) {
+            console.log(new Date().toISOString(), 'no muxed video', videoId, e.message.slice(0, 60));
+          }
+        }
 
         const val = {
           audio: audio.url,
-          video: video ? video.url : null,
+          video: muxed ? muxed.url : null,
+          videoUa: muxedUa,
+          videoWidth: (muxed && muxed.width) || null,
+          videoHeight: (muxed && muxed.height) || null,
+          // The muxed rendition is a different file with a different length, so
+          // it needs its own total for range maths.
+          videoTotal: (muxed && Number(muxed.contentLength)) || null,
           ua: client.ua,
           total,
           client: client.name,
@@ -465,7 +514,7 @@ async function streamMedia(req, res, kind, videoId) {
     return;
   }
 
-  const total = entry.total || null;
+  const total = (kind === 'video' ? entry.videoTotal : entry.total) || null;
   const range = total !== null ? parseRange(req.headers.range, total) : null;
   let start = range ? range.start : 0;
   let end = range ? range.end : null;
@@ -509,7 +558,7 @@ async function streamMedia(req, res, kind, videoId) {
 
     let upstream;
     try {
-      upstream = await openChunk(pick(), entry.ua, pos, chunkEnd);
+      upstream = await openChunk(pick(), kind === 'video' ? entry.videoUa || entry.ua : entry.ua, pos, chunkEnd);
     } catch (e) {
       if (retries++ < 2) {
         await sleep(150 * retries);
@@ -622,14 +671,28 @@ const server = http.createServer((req, res) => {
   // The Worker calls this the moment a track is selected, so the player call
   // finishes while the app is still opening the stream. Shares the same memo,
   // so it never costs a second resolve.
+  // The Worker calls this the moment a track is selected and waits for it, so
+  // the player call finishes while the app is still opening the stream. Same
+  // memo as /audio, so it never costs a second resolve. Only metadata goes back
+  // — the signed media URL stays here, because it is bound to this address.
   const warm = /^prewarm\/([A-Za-z0-9_-]{6,20})$/.exec(prefixPath);
   if (warm) {
+    const reply = (body) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
     resolveOnce(warm[1]).then(
-      () => {},
-      () => {}
+      (entry) =>
+        reply({
+          ok: true,
+          hasVideo: Boolean(entry.video),
+          width: entry.videoWidth || 0,
+          height: entry.videoHeight || 0,
+          total: entry.total || 0,
+          videoTotal: entry.videoTotal || 0,
+        }),
+      (e) => reply({ ok: false, error: String(e.message || e).slice(0, 200) })
     );
-    res.writeHead(202, { 'content-type': 'application/json' });
-    res.end('{"warming":true}');
     return;
   }
 

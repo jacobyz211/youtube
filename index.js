@@ -1,5 +1,11 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.12.0 — chunked reads + prewarmed playback
+// author: ricky | version: 2.13.0 — video support for Eclipse
+//
+// WHAT CHANGED IN 2.13.0 — /stream never advertised a video, so Eclipse had no
+// toggle to offer and the /video route was never called. It now sends the
+// `video` object the docs describe, pointing at a single muxed file, and waits
+// for the proxy's prewarm so that object (and the playback URL) is ready before
+// the app asks for bytes.
 //
 // WHAT CHANGED IN 2.12.0 — the proxy throttles a single long read, so long
 // tracks stalled and were skipped. /stream now also asks the proxy to resolve
@@ -840,20 +846,55 @@ async function resolveTrack(trackId, env, userToken) {
 // YouTube's "confirm you're not a bot" challenge.
 const STREAM_TTL_SEC = 6 * 3600;
 
-function buildStreamResponse(trackId, origin) {
+function buildStreamResponse(trackId, origin, meta) {
   const base = (origin || '').replace(/\/+$/, '');
-  return {
+  const out = {
     url: `${base}/audio/${trackId}`,
     format: 'm4a',
     quality: 'native',
     codec: 'aac',
     container: 'mp4',
+    // Routing fields: tell the app the bytes are a plain file, so it picks a
+    // playback engine before the first byte instead of probing.
+    manifest: 'none',
+    encrypted: false,
     expiresAt: Math.floor(Date.now() / 1000) + STREAM_TTL_SEC,
   };
+  // Eclipse only shows its video toggle when /stream offers a video. The proxy
+  // hands back one file that carries both picture and sound, which is what
+  // `muxed: true` means — that plays on every platform.
+  if (meta && meta.hasVideo) {
+    out.video = {
+      url: `${base}/video/${trackId}`,
+      mimeType: 'video/mp4',
+      muxed: true,
+    };
+    if (meta.width) out.video.width = meta.width;
+    if (meta.height) out.video.height = meta.height;
+  }
+  return out;
+}
+
+// Asks the proxy to resolve now and waits for the answer, so the player call is
+// finished before the app asks for bytes, and so this reply can advertise the
+// video rendition. A track that fails comes back without meta and /audio then
+// reports the real error.
+async function warmTrack(trackId) {
+  try {
+    const res = await fetch(`${MEDIA_PROXY}/prewarm/${encodeURIComponent(trackId)}`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) return null;
+    const meta = await res.json().catch(() => null);
+    return meta && meta.ok ? meta : null;
+  } catch {
+    return null;
+  }
 }
 
 async function handleStream(trackId, env, userToken, origin) {
-  return buildStreamResponse(trackId, origin);
+  return buildStreamResponse(trackId, origin, await warmTrack(trackId));
 }
 
 // ── Media proxy ─────────────────────────────────────────────────────────
@@ -1081,7 +1122,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.12.0', description: v.description,
+    id: v.id, name: v.name, version: '2.13.0', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
@@ -1323,10 +1364,9 @@ if (ECLIPSE_GATED_PREFIXES.some((p) => rest === p || rest.startsWith(p + "/"))) 
     const id = lastSegment(rest);
     if (!id) return jsonRes({ error: 'Missing ID' }, 400);
     // YouTube takes 0.4–3 s to hand back a playable URL, and the player asks for
-    // the bytes the instant this reply lands. Resolving it in the background
-    // now (same in-RAM entry, so it is not a second player call) is what makes
-    // pressing play feel immediate.
-    if (ctx?.waitUntil) ctx.waitUntil(fetch(`${MEDIA_PROXY}/prewarm/${encodeURIComponent(id)}`, { method: 'POST' }).catch(() => {}));
+    // the bytes the instant this reply lands. Resolving it here (same in-RAM
+    // entry, so it is not a second player call) is what makes pressing play feel
+    // immediate, and it is also how the video rendition gets advertised.
     return jsonRes(await handleStream(id, env, userToken, env?.PUBLIC_BASE_URL || url.origin));
   }
   // Media bytes are served by this Worker, not by googlevideo: the signed CDN
