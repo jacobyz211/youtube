@@ -835,7 +835,7 @@ async function resolveTrack(trackId, env, userToken) {
 // YouTube's "confirm you're not a bot" challenge.
 const STREAM_TTL_SEC = 6 * 3600;
 
-function buildStreamResponse(trackId, entry, origin) {
+function buildStreamResponse(trackId, origin) {
   const base = (origin || '').replace(/\/+$/, '');
   return {
     url: `${base}/audio/${trackId}`,
@@ -848,7 +848,7 @@ function buildStreamResponse(trackId, entry, origin) {
 }
 
 async function handleStream(trackId, env, userToken, origin) {
-  return buildStreamResponse(trackId, entry, origin);
+  return buildStreamResponse(trackId, origin);
 }
 
 // ── Media proxy ─────────────────────────────────────────────────────────

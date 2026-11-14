@@ -9,6 +9,10 @@ import { Readable } from 'node:stream';
 
 const PORT = Number(process.env.PORT || 8080);
 const SECRET = process.env.YTM_SECRET || '';
+// Optional: a signed-in YouTube cookie makes player calls immune to the
+// "confirm you're not a bot" challenge that datacenter IPs get. Set YTM_COOKIE
+// in the unit file to enable it.
+const COOKIE = process.env.YTM_COOKIE || '';
 if (!SECRET || SECRET.length < 16) {
   console.error('YTM_SECRET must be set to at least 16 characters');
   process.exit(1);
@@ -38,6 +42,9 @@ const CDN_UA = 'com.google.android.youtube/20.22.36 (Linux; U; Android 15) gzip'
 // instead of spending another player call. Never persisted.
 const MEMO_TTL_MS = 10 * 60 * 1000;
 const memo = new Map();
+// Set when every client is bot-challenged, so a burst of requests doesn't turn
+// into a burst of player calls and dig the hole deeper.
+let blockedUntil = 0;
 
 function memoGet(id) {
   const hit = memo.get(id);
@@ -58,6 +65,7 @@ async function player(client, videoId) {
       'user-agent': client.ua,
       'x-goog-api-format-version': '2',
       origin: 'https://www.youtube.com',
+      ...(COOKIE ? { cookie: COOKIE } : {}),
     },
     body: JSON.stringify({
       context: { client: client.ctx },
@@ -95,6 +103,7 @@ function bestVideo(sd) {
 async function resolve(videoId) {
   const cached = memoGet(videoId);
   if (cached) return cached;
+  if (Date.now() < blockedUntil) throw new Error('cooling down after a bot challenge');
   const errors = [];
   for (const client of CLIENTS) {
     try {
@@ -113,6 +122,9 @@ async function resolve(videoId) {
       errors.push(e.message);
       console.log(new Date().toISOString(), 'resolve failed', videoId, e.message);
     }
+  }
+  if (errors.length && errors.every((e) => e.includes('LOGIN_REQUIRED'))) {
+    blockedUntil = Date.now() + 60 * 1000;
   }
   throw new Error(errors.join(' | ') || 'no playable audio');
 }
