@@ -730,11 +730,11 @@ async function streamMedia(req, res, kind, videoId) {
     // Never let an intermediary keep a copy of a signed URL's bytes.
     'cache-control': 'no-store',
   };
-  if (range && total !== null) {
-    headers['content-range'] = `bytes ${start}-${end}/${total}`;
-  } else if (total !== null) {
-    headers['content-length'] = String(end - start + 1);
-  }
+  // A 206 without a length is sent chunked, and a player that sizes its buffer
+  // from Content-Length sits on "loading" forever without ever starting. Always
+  // declare it, for partial replies too.
+  if (total !== null) headers['content-length'] = String(end - start + 1);
+  if (range && total !== null) headers['content-range'] = `bytes ${start}-${end}/${total}`;
   res.writeHead(range && total !== null ? 206 : 200, headers);
 
   if (req.method === 'HEAD') {

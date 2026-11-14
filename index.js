@@ -1,5 +1,12 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.15.0 — stable home endpoint
+// author: ricky | version: 2.16.0 — replies carry their length
+//
+// WHAT CHANGED IN 2.16.0 — a seeked start (Range: bytes=0-) came back as a
+// chunked 206 with no Content-Length, and a player with no length to size a
+// buffer from waits on "loading" instead of playing. The length is now always
+// declared, and derived from Content-Range when the proxy omits it. Search got
+// a deadline per YouTube call and runs its category fallbacks together instead
+// of in sequence, which is what made search slow and sometimes songs-less.
 //
 // WHAT CHANGED IN 2.15.0 — the home box is reached over an SSH reverse tunnel on
 // this VPS (port 8081) instead of a Cloudflare quick tunnel, so its address is
@@ -243,8 +250,13 @@ function buildIosContext(visitorData) {
   return ctx;
 }
 
+// Every call to YouTube gets a deadline. Without one a single stalled request
+// held the whole search open until the platform gave up on it, which is what
+// made searching feel slow.
+const YT_CALL_TIMEOUT_MS = 4500;
+
 async function ytmPost(path, body, env, userToken) {
-  const resp = await fetch(`${YTM_BASE}${path}`, { method: 'POST', headers: SEARCH_HEADERS, body: JSON.stringify(body) });
+  const resp = await fetch(`${YTM_BASE}${path}`, { method: 'POST', headers: SEARCH_HEADERS, body: JSON.stringify(body), signal: AbortSignal.timeout(YT_CALL_TIMEOUT_MS) });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} HTTP ${resp.status} on ${path}`);
   const data = await resp.json();
   tryRefreshVisitor(data, env, userToken);
@@ -259,6 +271,7 @@ async function ytmBrowse(browseId, env, userToken) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_MUSIC_UA },
       body: JSON.stringify({ context: { client: ANDROID_MUSIC_CLIENT }, browseId }),
+      signal: AbortSignal.timeout(YT_CALL_TIMEOUT_MS),
     });
     if (!resp.ok) throw new Error(`${LOG_PREFIX} HTTP ${resp.status} on browse (both clients failed)`);
     return resp.json();
@@ -276,6 +289,7 @@ async function ytmSearchAndroid(query, params, env) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_MUSIC_UA },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(YT_CALL_TIMEOUT_MS),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} Android search HTTP ${resp.status}`);
   return resp.json();
@@ -601,38 +615,61 @@ async function handleSearch(query, env, userToken, mode) {
   }
   if (plR.status === 'fulfilled' && plR.value) for (const s of getShelves(plR.value)) for (const it of s.contents || []) { const p = parsePlaylistItem(it); if (p && playlists.length < 12) playlists.push(p); }
 
-  // ── Sequential backfill: only for empty categories, one at a time ──
+  // ── Backfill: only for empty categories, and all at once ──
+  // These used to run one after another, so a query that missed two categories
+  // paid two extra round trips in sequence before it could answer. They are
+  // independent, so they go out together and each has its own deadline.
   const needTracks = fetchSongs && tracks.length === 0;
   const needAlbums = fetchAlbums && albums.length === 0;
   const needArtists = artists.length === 0;
   const needPlaylists = playlists.length === 0;
 
+  const [tFB, aFB, arFB, pFB] = await Promise.allSettled([
+    needTracks ? ytmSearchAndroid(query, SEARCH_PARAMS.songs, env) : null,
+    needAlbums ? ytmSearchAndroid(query, SEARCH_PARAMS.albums, env) : null,
+    needArtists ? ytmSearchAndroid(query, SEARCH_PARAMS.artists, env) : null,
+    needPlaylists ? ytmSearchAndroid(query, SEARCH_PARAMS.playlists, env) : null,
+  ]);
+
   if (needTracks) {
-    try {
-      const tFB = await ytmSearchAndroid(query, SEARCH_PARAMS.songs, env);
-      for (const s of getShelves(tFB)) for (const it of s.contents || []) { addTrack(parseTrackRenderer(it.musicResponsiveListItemRenderer)); if (tracks.length >= 40) break; }
-    } catch (e) { console.log(LOG_PREFIX, 'tracks backfill failed:', e.message); }
+    if (tFB.status === 'fulfilled' && tFB.value) {
+      for (const s of getShelves(tFB.value)) for (const it of s.contents || []) { addTrack(parseTrackRenderer(it.musicResponsiveListItemRenderer)); if (tracks.length >= 40) break; }
+    } else {
+      console.log(LOG_PREFIX, 'tracks backfill failed:', tFB.reason?.message || 'empty');
+    }
   }
   if (needAlbums) {
-    try {
-      const aFB = await ytmSearchAndroid(query, SEARCH_PARAMS.albums, env);
-      for (const s of getShelves(aFB)) for (const it of s.contents || []) { const a = parseAlbumItem(it); if (a && albums.length < 15) albums.push(a); }
-    } catch (e) { console.log(LOG_PREFIX, 'albums backfill failed:', e.message); }
+    if (aFB.status === 'fulfilled' && aFB.value) {
+      for (const s of getShelves(aFB.value)) for (const it of s.contents || []) { const a = parseAlbumItem(it); if (a && albums.length < 15) albums.push(a); }
+    } else {
+      console.log(LOG_PREFIX, 'albums backfill failed:', aFB.reason?.message || 'empty');
+    }
   }
   if (needArtists) {
-    try {
-      const arFB = await ytmSearchAndroid(query, SEARCH_PARAMS.artists, env);
-      for (const s of getShelves(arFB)) for (const it of s.contents || []) {
+    if (arFB.status === 'fulfilled' && arFB.value) {
+      for (const s of getShelves(arFB.value)) for (const it of s.contents || []) {
         const a = parseArtistItem(it);
         if (a && !seenArtistIds.has(a.id) && artists.length < 12) { seenArtistIds.add(a.id); artists.push(a); }
       }
-    } catch (e) { console.log(LOG_PREFIX, 'artists backfill failed:', e.message); }
+    } else {
+      console.log(LOG_PREFIX, 'artists backfill failed:', arFB.reason?.message || 'empty');
+    }
   }
   if (needPlaylists) {
-    try {
-      const pFB = await ytmSearchAndroid(query, SEARCH_PARAMS.playlists, env);
-      for (const s of getShelves(pFB)) for (const it of s.contents || []) { const p = parsePlaylistItem(it); if (p && playlists.length < 12) playlists.push(p); }
-    } catch (e) { console.log(LOG_PREFIX, 'playlists backfill failed:', e.message); }
+    if (pFB.status === 'fulfilled' && pFB.value) {
+      for (const s of getShelves(pFB.value)) for (const it of s.contents || []) { const p = parsePlaylistItem(it); if (p && playlists.length < 12) playlists.push(p); }
+    } else {
+      console.log(LOG_PREFIX, 'playlists backfill failed:', pFB.reason?.message || 'empty');
+    }
+  }
+  // The broad query is already in hand and mixes songs with videos, so it is a
+  // free last resort: a search that shows only videos because the songs query
+  // came back empty still gets its songs this way.
+  if (needTracks && tracks.length === 0 && broadR.status === 'fulfilled' && broadR.value) {
+    for (const s of getShelves(broadR.value)) for (const it of s.contents || []) {
+      addTrack(parseTrackRenderer(it.musicResponsiveListItemRenderer));
+      if (tracks.length >= 40) break;
+    }
   }
   if (needTracks || needAlbums || needArtists || needPlaylists) {
     console.log(LOG_PREFIX, `category backfill for "${query}": tracks=${needTracks} albums=${needAlbums} artists=${needArtists} playlists=${needPlaylists}`);
@@ -1015,6 +1052,13 @@ async function proxyMedia(trackId, kind, incomingRequest, env, userToken) {
     // be what the player keeps replaying, and the bytes are cheap to re-pull.
     'cache-control': 'no-store',
   };
+  // A partial reply must still carry its length. Handing the player a chunked
+  // 206 leaves it with nothing to size a buffer from, and it waits on "loading"
+  // instead of playing, so it is derived from the range when it is missing.
+  if (!length && contentRange) {
+    const m = /^bytes\s+(\d+)-(\d+)\//.exec(contentRange);
+    if (m) length = String(Number(m[2]) - Number(m[1]) + 1);
+  }
   if (length) out['content-length'] = length;
   if (contentRange) out['content-range'] = contentRange;
 
@@ -1184,7 +1228,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.15.0', description: v.description,
+    id: v.id, name: v.name, version: '2.16.0', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
