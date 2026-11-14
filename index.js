@@ -1,5 +1,11 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.10.2 — proxied bytes, no caching
+// author: ricky | version: 2.10.3 — proxied bytes, Range-always upstream
+//
+// WHAT CHANGED IN 2.10.3 — the CDN signs these URLs with rqh=1 (range
+// required), so a plain GET with no Range header was rejected and surfaced as
+// a 500. We now always send Range upstream and answer 200 + full length when
+// the caller sent none. Resolutions are also held in isolate memory for 90s
+// so a seek is not another player call (RAM only — nothing persisted).
 //
 // WHAT CHANGED IN 2.10.2 — nothing is cached anymore. 2.10.1 (below) is the
 // change that actually made playback possible.
@@ -760,7 +766,33 @@ async function resolveStream(kind, trackId, env, userToken) {
 }
 
 // Try the live clients in order, honouring the bot cooldown.
+// ── In-RAM resolution memo ───────────────────────────────────────────────
+// Deliberately NOT a cache: nothing is written to Redis, KV, D1 or disk. These
+// entries exist only inside this isolate's memory and vanish with it. The point
+// is that a seek (one more Range request on the same track) doesn't turn into
+// another player call.
+const MEMO_TTL_MS = 90 * 1000;
+const MEMO_MAX = 40;
+const memo = new Map();
+
+function memoGet(id) {
+  const hit = memo.get(id);
+  if (!hit) return null;
+  if (hit.expires < Date.now()) { memo.delete(id); return null; }
+  return hit.entry;
+}
+
+function memoSet(id, entry) {
+  const urlExpiry = entry.expiresAt ? entry.expiresAt * 1000 - 30000 : Infinity;
+  const expires = Math.min(Date.now() + MEMO_TTL_MS, urlExpiry);
+  if (expires <= Date.now()) return;
+  if (memo.size >= MEMO_MAX) memo.delete(memo.keys().next().value);
+  memo.set(id, { entry, expires });
+}
+
 async function resolveTrack(trackId, env, userToken) {
+  const memoHit = memoGet(trackId);
+  if (memoHit) return memoHit;
   const kinds = ['android', 'androidvr', 'ios'];
   const available = kinds.filter(k => !clientCoolingDown(PLAYER_CLIENTS[k].label));
   const order = available.length ? available : kinds;
@@ -774,6 +806,7 @@ async function resolveTrack(trackId, env, userToken) {
     try {
       const entry = await resolveStream(kind, trackId, env, userToken);
       console.log(LOG_PREFIX, `${PLAYER_CLIENTS[kind].label} resolved ${trackId}`);
+      memoSet(trackId, entry);
       return entry;
     } catch (e) {
       lastError = e;
@@ -846,28 +879,28 @@ const CDN_HEADERS = {
 async function proxyMedia(trackId, kind, incomingRequest, env, userToken) {
   const wantsVideo = kind === 'video';
   const method = incomingRequest.method === 'HEAD' ? 'HEAD' : 'GET';
-  const range = incomingRequest.headers.get('range');
+  const clientRange = incomingRequest.headers.get('range');
+  // googlevideo signs these URLs with rqh=1 ("range required"): fetching one
+  // without a Range header is rejected outright, which is what made a plain
+  // GET — exactly what a player does first — fail with a 500. Ask for the whole
+  // file explicitly instead.
+  const upstreamRange = clientRange || 'bytes=0-';
 
   for (let attempt = 0; attempt < 3; attempt++) {
     const entry = await resolveTrack(trackId, env, userToken);
     const target = wantsVideo ? entry.video?.url : entry.url;
     if (!target) {
-      if (wantsVideo) {
-        // The cached resolution came from a client that had no muxed video;
-        // re-resolve once in case another client does.
-        continue;
-      }
+      if (wantsVideo) continue; // another client may expose a muxed video
       throw new Error(`${LOG_PREFIX} no ${kind} source for ${trackId}`);
     }
 
-    const headers = { ...CDN_HEADERS };
+    const headers = { ...CDN_HEADERS, Range: upstreamRange };
     if (env?.YT_COOKIE) headers.Cookie = env.YT_COOKIE;
-    if (range) headers.Range = range;
 
     const upstream = await fetch(target, { method, headers });
 
     // 403 from the CDN means the signature was minted for a different egress
-    // address than this fetch used. Drop the cache and mint again.
+    // address than this fetch used. Mint a new one and try again.
     if (upstream.status === 403 || upstream.status === 401) {
       console.log(LOG_PREFIX, `${kind} ${upstream.status} for ${trackId} — re-minting URL (attempt ${attempt + 1})`);
       continue;
@@ -876,20 +909,33 @@ async function proxyMedia(trackId, kind, incomingRequest, env, userToken) {
       throw new Error(`${LOG_PREFIX} CDN ${upstream.status} for ${trackId}`);
     }
 
+    const contentRange = upstream.headers.get('content-range') || '';
+    const total = /\/(\d+)\s*$/.exec(contentRange)?.[1];
+    let status = upstream.status;
+    let outLength = upstream.headers.get('content-length');
+    let outRange = contentRange;
+
+    // The client asked for the whole file, so answer 200 with the total length
+    // rather than leaking our internal "bytes=0-" as a 206.
+    if (!clientRange && status === 206) {
+      status = 200;
+      if (total) outLength = total;
+      outRange = '';
+    }
+
     const out = {
       'content-type': wantsVideo ? 'video/mp4' : 'audio/mp4',
       'accept-ranges': 'bytes',
       'access-control-allow-origin': '*',
       'access-control-allow-methods': 'GET, HEAD, OPTIONS',
-      'access-control-allow-headers': 'Range',
+      'access-control-allow-headers': 'Range, If-Range, Content-Type',
       'access-control-expose-headers': 'Content-Range, Content-Length, Accept-Ranges',
       'cache-control': 'private, max-age=3600',
     };
-    for (const h of ['content-range', 'content-length']) {
-      const v = upstream.headers.get(h);
-      if (v) out[h] = v;
-    }
-    return new Response(method === 'HEAD' ? null : upstream.body, { status: upstream.status, headers: out });
+    if (outLength) out['content-length'] = outLength;
+    if (outRange) out['content-range'] = outRange;
+
+    return new Response(method === 'HEAD' ? null : upstream.body, { status, headers: out });
   }
   throw new Error(`${LOG_PREFIX} CDN kept rejecting the signed URL for ${trackId}`);
 }
@@ -1057,7 +1103,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.10.2', description: v.description,
+    id: v.id, name: v.name, version: '2.10.3', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
