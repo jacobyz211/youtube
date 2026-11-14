@@ -40,13 +40,42 @@ YouTube hands out two kinds of media URL. An ordinary one serves the whole
 file. A "limited" one serves about 1 MiB and then 403s — which is what made
 tracks stall halfway. Before accepting a URL the service asks for its last byte;
 a real URL answers `206`, a limited one answers `403`, and a limited URL is
-dropped while the next client is asked instead. No PO token is needed for the
+dropped while the next client is asked instead. Only `401/403/410` means
+limited: googlevideo redirects some range requests to another backend with a
+`302`, and counting that as a failure threw away perfectly good URLs.
+
+The limited state is not permanent. When one address asks for many tracks
+quickly YouTube starts answering every client with a limited URL; a round of
+retries a moment later normally returns a whole-file URL, so the service runs
+up to three rounds before it gives up on a track. No PO token is needed for the
 clients above.
+
+## Chunked reading (why long tracks used to be skipped)
+
+googlevideo throttles a **single long read** from a datacenter address to a
+trickle — measured here at about 0.5 KB/s, so a 50 MB track never finished and
+the player skipped it after waiting. The same URL read in **2 MiB ranges** moves
+at 5–9 MB/s, because each range is a fresh request.
+
+So the body is pulled in `YTM_CHUNK_BYTES` (default 2 MiB) ranges and written
+straight through to the player, with `content-length` declared up front. A 403
+partway through a long track is not fatal: the URL is re-minted and the read
+continues from the byte it reached, so the player's connection never breaks.
+
+## Prewarming
+
+`/stream` fires `/<secret>/prewarm/<id>`, which starts the resolve and answers
+`202` immediately. The player then asks for `/audio/<id>` a moment later and
+finds the URL already done, because both share the in-flight map — it is the
+same resolve, not a second player call. This is what removed the second of dead
+time between tapping a track and hearing it.
 
 If every client is challenged, the service falls back to `yt-dlp` (installed at
 `~/.local/bin/yt-dlp`, run with `--source-address` so it also uses WARP) and
-applies the same probe. Per-track URLs are memoised in RAM for five minutes so a
-seek does not cost another player call; nothing is written to disk.
+applies the same probe. That fallback is skipped when every client simply said
+`UNPLAYABLE` — the track is gone, and waiting two seconds to confirm it only
+delays the player's skip. Per-track URLs are memoised in RAM for five minutes so
+a seek does not cost another player call; nothing is written to disk.
 
 Optional: put a signed-in YouTube cookie in the unit as
 `Environment=YTM_COOKIE=...` if the challenge ever comes back.

@@ -908,7 +908,9 @@ async function proxyMedia(trackId, kind, incomingRequest, env, userToken) {
     'access-control-allow-methods': 'GET, HEAD, OPTIONS',
     'access-control-allow-headers': 'Range, If-Range, Content-Type',
     'access-control-expose-headers': 'Content-Range, Content-Length, Accept-Ranges',
-    'cache-control': 'private, max-age=3600',
+    // No stored copy on the device either: a truncated first attempt must never
+    // be what the player keeps replaying, and the bytes are cheap to re-pull.
+    'cache-control': 'no-store',
   };
   if (length) out['content-length'] = length;
   if (contentRange) out['content-range'] = contentRange;
