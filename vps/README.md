@@ -121,6 +121,20 @@ ANDROID call that produces the muxed rendition is now started once at the
 beginning of the resolve, shared with the race, and awaited in parallel with the
 audio probe.
 
+## Tracks are served as HLS, not as one file
+
+YouTube's audio is fragmented MP4: a 759-byte init segment, then a list of
+`moof`/`mdat` fragments of about ten seconds each. Handed over as one progressive
+file, AVFoundation refuses it — the app reports "the data couldn't be read because
+it isn't in the correct format" while every byte arrives — so the same bytes are
+described as an HLS playlist instead: `/hls/<id>/playlist.m3u8` lists one init
+segment plus one entry per fragment, each addressed as a byte range read straight
+out of the file's own `sidx` index. Nothing is transcoded and no byte is moved.
+
+The fragment table is trusted only after it checks out: every reference must
+land on a `moof` box, and the sizes must sum to the file. If a track has no usable
+index the playlist is refused rather than guessed at.
+
 ## Every reply declares its length
 
 Audio and video replies always carry `Content-Length`, partial (`206`) ones
