@@ -121,6 +121,14 @@ ANDROID call that produces the muxed rendition is now started once at the
 beginning of the resolve, shared with the race, and awaited in parallel with the
 audio probe.
 
+## Every reply declares its length
+
+Audio and video replies always carry `Content-Length`, partial (`206`) ones
+included. A partial reply without a length goes out chunked, and a player that
+sizes its buffer from the length then waits on "loading" forever instead of
+playing — the URL answers `206` and looks healthy in curl, so this is worth
+checking first whenever the app spins on every track while the proxy looks fine.
+
 Eclipse only shows its video toggle for a track whose `/stream` reply carries a
 `video` object, and it wants **one file with picture and sound** (`muxed: true`).
 VISIONOS and IOS return adaptive formats only, which are video-only, so a track
