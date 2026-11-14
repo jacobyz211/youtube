@@ -17,8 +17,9 @@ if errorlevel 1 (
   echo Media proxy already running on port 8080.
 )
 
-rem Full path: a shell with GNU timeout on PATH would swallow a bare `timeout`.
-"%SystemRoot%\System32\timeout.exe" /t 2 /nobreak >nul
+rem ping rather than `timeout`: timeout refuses to run when stdin is redirected,
+rem which is what happens if this is launched from a script.
+ping -n 3 127.0.0.1 >nul
 
 start "ytm-tunnel" /min ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -R 0.0.0.0:8081:127.0.0.1:8080 vps
 
@@ -26,4 +27,4 @@ echo.
 echo Tunnel started: the VPS forwards port 8081 back to this laptop.
 echo Keep this machine awake while you listen. Close the two minimized
 echo windows ("ytm-proxy", "ytm-tunnel") to stop.
-"%SystemRoot%\System32\timeout.exe" /t 4 /nobreak >nul
+ping -n 5 127.0.0.1 >nul
