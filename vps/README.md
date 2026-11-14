@@ -85,8 +85,12 @@ applies the same probe. That fallback is skipped when every client simply said
 delays the player's skip. Per-track URLs are memoised in RAM for five minutes so
 a seek does not cost another player call; nothing is written to disk.
 
-Optional: put a signed-in YouTube cookie in the unit as
-`Environment=YTM_COOKIE=...` if the challenge ever comes back.
+`YTM_COOKIE` is accepted but measured useless, and worse than useless with a
+signature attached. A real signed-in session (confirmed with `account_menu`:
+signed in, from both the WARP and the direct address) still gets
+`UNPLAYABLE: Video unavailable` for a licensed art track, and adding the
+`SAPISIDHASH` header that InnerTube expects makes the iOS/Android clients answer
+`HTTP 400`. The block is the address, not the credentials.
 
 ## Unused extra
 

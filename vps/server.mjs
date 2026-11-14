@@ -31,7 +31,10 @@ const PORT = Number(process.env.PORT || 8080);
 const SECRET = process.env.YTM_SECRET || '';
 // WARP tunnel source address (see /etc/wireguard/wgcf.conf). Empty = direct.
 const WARP_LOCAL_ADDR = process.env.YTM_WARP_LOCAL_ADDR ?? '172.16.0.2';
-// Optional: a signed-in YouTube cookie.
+// Optional: a signed-in YouTube cookie. Measured: a valid session (verified via
+// account_menu) does not make licensed art tracks playable from a datacenter
+// address, and pairing the cookie with a SAPISIDHASH signature makes the mobile
+// clients answer 400. Left off unless someone finds a case where it helps.
 const COOKIE = process.env.YTM_COOKIE || '';
 // Used only when every InnerTube client has been challenged or hands back a
 // limited URL.
