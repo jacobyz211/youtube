@@ -898,17 +898,22 @@ async function resolveTrack(trackId, env, userToken) {
 // YouTube's "confirm you're not a bot" challenge.
 const STREAM_TTL_SEC = 6 * 3600;
 
+// HLS, not a single file. YouTube's audio is fragmented MP4, and AVFoundation
+// answers a progressive fMP4 with "the data couldn't be read because it isn't in
+// the correct format" while every byte arrives. The same bytes described as an
+// HLS playlist — one init segment plus one entry per fragment, each a byte range
+// of the track — play natively in Eclipse, so that is what /stream advertises.
 function buildStreamResponse(trackId, origin, meta) {
   const base = (origin || '').replace(/\/+$/, '');
   const out = {
-    url: `${base}/audio/${trackId}`,
-    format: 'm4a',
+    url: `${base}/hls/${trackId}/playlist.m3u8`,
+    format: 'aac',
     quality: 'native',
     codec: 'aac',
-    container: 'mp4',
-    // Routing fields: tell the app the bytes are a plain file, so it picks a
-    // playback engine before the first byte instead of probing.
-    manifest: 'none',
+    container: 'fmp4',
+    // Routing fields: tell the app the bytes are a playlist, so it picks the HLS
+    // engine before the first byte instead of probing the media.
+    manifest: 'hls',
     encrypted: false,
     expiresAt: Math.floor(Date.now() / 1000) + STREAM_TTL_SEC,
   };
@@ -1004,6 +1009,53 @@ const MEDIA_PROXY_VPS = 'http://15-204-247-1.sslip.io:8080/k7f2q9w4e1r8t5y3u6i0o
 // milliseconds, which is cheap enough to pay on every request.
 function mediaProxyOrder() {
   return [MEDIA_PROXY_HOME, MEDIA_PROXY_VPS];
+}
+
+// HLS playlist, init segment and fragment bytes. Same rule as the media path:
+// one box mints the URL and serves the bytes, so the signed IP always matches.
+const HLS_PATH = /^\/hls\/([A-Za-z0-9_-]{6,20})\/(playlist\.m3u8|init|media)$/;
+
+async function proxyHls(rest, incomingRequest) {
+  const m = HLS_PATH.exec(rest);
+  if (!m) return jsonRes({ error: 'Not found' }, 404);
+  const id = m[1];
+  const file = m[2];
+  const method = incomingRequest.method === 'HEAD' ? 'HEAD' : 'GET';
+  const clientRange = incomingRequest.headers.get('range');
+
+  let upstream = null;
+  for (const base of mediaProxyOrder()) {
+    try {
+      const res = await fetch(`${base}/hls/${id}/${file}`, {
+        method,
+        headers: clientRange ? { range: clientRange } : {},
+      });
+      if (res.ok || res.status === 206) {
+        upstream = res;
+        break;
+      }
+    } catch {
+      // Try the other box; a dead tunnel refuses in milliseconds.
+    }
+  }
+  if (!upstream) throw new Error(`${LOG_PREFIX} hls ${file} unavailable for ${id}`);
+
+  const out = {
+    'access-control-allow-origin': '*',
+    'access-control-expose-headers': 'Content-Range, Content-Length, Accept-Ranges',
+    'cache-control': 'no-store',
+  };
+  if (file === 'playlist.m3u8') {
+    out['content-type'] = 'application/vnd.apple.mpegurl';
+  } else {
+    out['content-type'] = file === 'init' ? 'video/mp4' : 'audio/mp4';
+    out['accept-ranges'] = 'bytes';
+    const len = upstream.headers.get('content-length');
+    if (len) out['content-length'] = len;
+    const cr = upstream.headers.get('content-range');
+    if (cr) out['content-range'] = cr;
+  }
+  return new Response(method === 'HEAD' ? null : upstream.body, { status: upstream.status, headers: out });
 }
 
 async function proxyMedia(trackId, kind, incomingRequest, env, userToken) {
@@ -1491,6 +1543,7 @@ if (ECLIPSE_GATED_PREFIXES.some((p) => rest === p || rest.startsWith(p + "/"))) 
   // URL is only valid from the IP that minted it. These two are deliberately
   // not behind the Eclipse gate — a player fetching an audio URL does not send
   // the addon's access header.
+  if (rest.startsWith('/hls/')) return await proxyHls(rest, request);
   if (rest.startsWith('/audio/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return await proxyMedia(id, 'audio', request, env, userToken); }
   if (rest.startsWith('/video/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return await proxyMedia(id, 'video', request, env, userToken); }
   if (rest.startsWith('/download/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return await proxyDownload(id, request, env, userToken); }

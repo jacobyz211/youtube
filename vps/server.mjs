@@ -858,6 +858,154 @@ async function streamMedia(req, res, kind, videoId) {
   res.end();
 }
 
+// ── HLS ─────────────────────────────────────────────────────────────────
+// YouTube's adaptive audio is fragmented MP4: a small init segment (ftyp+moov)
+// followed by a list of moof/mdat fragments, each a few seconds of audio, with a
+// sidx box indexing all of them. Handed over as one progressive file, AVFoundation
+// refuses it outright — "the data couldn't be read because it isn't in the correct
+// format" — even though every byte arrives. HLS is the container built for exactly
+// this shape and Eclipse plays it natively, so the same bytes are described as a
+// playlist: one init segment plus one entry per fragment addressed by byte range.
+// Nothing is transcoded; the media is already segmented, only the index is read.
+const HLS_HEAD_BYTES = 40000;
+const HLS_CACHE_MS = 5 * 60 * 1000;
+const hlsCache = new Map();
+
+async function fetchHead(target, ua, bytes) {
+  const r = await request(target, {
+    headers: { range: `bytes=0-${bytes - 1}`, 'user-agent': ua, origin: 'https://www.youtube.com' },
+    follow: 3,
+    timeout: 20000,
+  });
+  if (r.status !== 200 && r.status !== 206) {
+    r.stream.resume();
+    throw new Error(`head ${r.status}`);
+  }
+  const chunks = [];
+  let n = 0;
+  for await (const b of r.stream) {
+    chunks.push(b);
+    n += b.length;
+    if (n >= bytes) break;
+  }
+  return Buffer.concat(chunks);
+}
+
+// Reads ftyp/moov/sidx and turns the sidx references into playlist entries.
+function buildHls(target, head) {
+  let o = 0;
+  let initEnd = 0;
+  let sidx = null;
+  while (o + 8 <= head.length) {
+    const size = head.readUInt32BE(o);
+    const type = head.toString('latin1', o + 4, o + 8);
+    if (size < 8) break;
+    if (type === 'moov') initEnd = o + size;
+    if (type === 'sidx') {
+      sidx = { start: o, size, body: head.subarray(o + 8, Math.min(o + size, head.length)) };
+      break;
+    }
+    o += size;
+  }
+  if (!sidx || !initEnd || sidx.body.length < 24) return null;
+
+  const b = sidx.body;
+  const version = b[0];
+  let p = 4;
+  const timescale = b.readUInt32BE(p + 4);
+  p += 8;
+  let firstOffset;
+  if (version === 0) {
+    firstOffset = b.readUInt32BE(p + 4);
+    p += 8;
+  } else {
+    firstOffset = Number(b.readBigUInt64BE(p + 8));
+    p += 16;
+  }
+  p += 2;
+  const count = b.readUInt16BE(p);
+  p += 2;
+  if (!count || !timescale || p + count * 12 > b.length) return null;
+
+  let offset = sidx.start + sidx.size + firstOffset;
+  const segs = [];
+  let maxSecs = 0;
+  let duration = 0;
+  for (let i = 0; i < count; i++) {
+    const ref = b.readUInt32BE(p + i * 12);
+    const dur = b.readUInt32BE(p + i * 12 + 4);
+    if (ref >>> 31) return null; // references another index: not what YouTube emits
+    const size = ref & 0x7fffffff;
+    if (!size || !dur) return null;
+    const secs = dur / timescale;
+    segs.push({ offset, size, secs });
+    offset += size;
+    duration += secs;
+    if (secs > maxSecs) maxSecs = secs;
+  }
+  if (!segs.length) return null;
+
+  const lines = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:7',
+    `#EXT-X-TARGETDURATION:${Math.max(1, Math.ceil(maxSecs))}`,
+    '#EXT-X-MEDIA-SEQUENCE:0',
+    '#EXT-X-PLAYLIST-TYPE:VOD',
+    '#EXT-X-INDEPENDENT-SEGMENTS',
+    '#EXT-X-MAP:URI="init"',
+  ];
+  for (const s of segs) {
+    lines.push(`#EXTINF:${s.secs.toFixed(5)},`);
+    lines.push(`#EXT-X-BYTERANGE:${s.size}@${s.offset}`);
+    lines.push('media');
+  }
+  lines.push('#EXT-X-ENDLIST');
+  return { target, initEnd, duration, playlist: lines.join('\n') + '\n' };
+}
+
+async function hlsFor(videoId) {
+  const hit = hlsCache.get(videoId);
+  if (hit && hit.exp > Date.now()) return hit;
+  const entry = await resolveOnce(videoId);
+  if (!entry.audio) throw new Error('no audio');
+  const head = await fetchHead(entry.audio, entry.ua, HLS_HEAD_BYTES);
+  const built = buildHls(entry.audio, head);
+  if (!built) throw new Error('no fragment index');
+  const out = { ...built, exp: Date.now() + HLS_CACHE_MS };
+  if (hlsCache.size > 50) hlsCache.delete(hlsCache.keys().next().value);
+  hlsCache.set(videoId, out);
+  return out;
+}
+
+// Streams one fixed byte slice of the track, used for the init segment.
+async function streamSlice(req, res, kind, videoId, start, end) {
+  const entry = await resolveOnce(videoId);
+  const target = entry.audio;
+  if (!target) {
+    res.writeHead(404, { 'content-type': 'text/plain' });
+    res.end('no audio');
+    return;
+  }
+  const upstream = await openChunk(target, entry.ua, start, end);
+  if (upstream.status !== 200 && upstream.status !== 206) {
+    upstream.stream.resume();
+    res.writeHead(502, { 'content-type': 'text/plain' });
+    res.end('upstream ' + upstream.status);
+    return;
+  }
+  let buf = Buffer.alloc(0);
+  for await (const b of upstream.stream) buf = Buffer.concat([buf, b]);
+  buf = patchBrand(buf.subarray(0, end - start + 1), kind);
+  res.writeHead(200, {
+    'content-type': 'video/mp4',
+    'content-length': String(buf.length),
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
+  });
+  if (req.method !== 'HEAD') res.write(buf);
+  res.end();
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
 
@@ -893,6 +1041,42 @@ const server = http.createServer((req, res) => {
   // the player call finishes while the app is still opening the stream. Same
   // memo as /audio, so it never costs a second resolve. Only metadata goes back
   // — the signed media URL stays here, because it is bound to this address.
+  // Playlist, init segment and the fragment bytes the playlist addresses.
+  const hls = /^hls\/([A-Za-z0-9_-]{6,20})\/(playlist\.m3u8|init|media)$/.exec(prefixPath);
+  if (hls) {
+    const id = hls[1];
+    if (hls[2] === 'playlist.m3u8') {
+      hlsFor(id).then(
+        (built) => {
+          res.writeHead(200, {
+            'content-type': 'application/vnd.apple.mpegurl',
+            'cache-control': 'no-store',
+            'access-control-allow-origin': '*',
+          });
+          res.end(built.playlist);
+        },
+        (e) => {
+          console.log(new Date().toISOString(), 'hls failed', id, e.message);
+          res.writeHead(502, { 'content-type': 'text/plain' });
+          res.end('hls failed: ' + e.message);
+        }
+      );
+      return;
+    }
+    if (hls[2] === 'init') {
+      hlsFor(id).then(
+        (built) => streamSlice(req, res, 'audio', id, 0, built.initEnd - 1),
+        (e) => {
+          res.writeHead(502, { 'content-type': 'text/plain' });
+          res.end('hls failed: ' + e.message);
+        }
+      );
+      return;
+    }
+    streamMedia(req, res, 'audio', id);
+    return;
+  }
+
   const warm = /^prewarm\/([A-Za-z0-9_-]{6,20})$/.exec(prefixPath);
   if (warm) {
     const reply = (body) => {
