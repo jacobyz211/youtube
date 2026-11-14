@@ -1,18 +1,16 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.15 (seekable replies)
-// Changes from 2.9.14:
-//   - SEEKING. googlevideo serves byte ranges correctly (206 at 50% and 95%),
-//     so the refusal was ours, not theirs. Two causes fixed:
-//       * /stream sent no codec/container/manifest, so Eclipse had to guess a
-//         playback engine by probing the file; the guess can land on one that
-//         will not scrub. Replies now say aac / mp4 / manifest none, or
-//         aac / fmp4 / hls for a playlist;
-//       * resolveIOS returned the HLS manifest whenever it won the chain, and
-//         googlevideo's HLS is the least seekable thing it serves. It now
-//         prefers the plain audio file and only falls back to HLS.
-//   - The verification probe now reads at ~60% of the file (it reads the size
-//     from the URL's own clen parameter), so a link that plays from the start
-//     but refuses a mid-song range is rejected instead of handed out.
+// author: ricky | version: 2.9.16 (playback restored)
+// Changes from 2.9.15 — 2.9.15 stopped playback, so it is reverted in full:
+//   - resolveIOS hands out the HLS manifest first again, exactly like "YouTube
+//     Music Direct" (its PLAYBACK_ORDER leads with ios-hls). Preferring the
+//     adaptive audio file sent every iOS reply down the gated path instead.
+//   - the verification probe is back to the plain read past 1 MiB. Sizing it
+//     from the URL's own clen parameter rejected links that do play fine.
+//   - /stream replies are back to their 2.9.14 shape: no codec/container/
+//     manifest keys. They are optional in the docs, and adding them was the one
+//     thing that changed on EVERY reply when playback broke.
+//   - the Direct fallback ranks sources in the module's own order:
+//     ios-hls, android-progressive, android-audio, ios-audio, android-hls.
 // Changes from 2.9.13:
 //   - ADOPTED from the working "YouTube Music Direct" module (nvmindl, v5.3):
 //     a link is now VERIFIED before it is handed out. A PO-token-gated
@@ -1031,14 +1029,9 @@ async function fetchVideoInfo(trackId, env, userToken) {
 }
 async function resolveIOS(trackId, env, userToken) {
   const data = await fetchPlayerData(trackId, env, userToken);
-  // Audio file first, HLS only if there is nothing else. googlevideo's HLS is
-  // the least seekable thing it serves — scrubbing it stalls or snaps back —
-  // and it was what this resolver handed out whenever it won the chain.
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   const hlsUrl = data?.streamingData?.hlsManifestUrl;
   if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
-  throw new Error('no usable format');
+  throw new Error('no HLS');
 }
 async function resolveMWeb(trackId, env, userToken) {
   const data = await fetchPlayerDataMWeb(trackId, env, userToken);
@@ -1170,16 +1163,21 @@ async function directCheckHls(media) {
 function directCheck(media) {
   return media.isHls ? directCheckHls(media) : directCheckFile(media);
 }
+// Ranked exactly as the module ranks them (PLAYBACK_ORDER): iOS HLS answers
+// fastest, Android muxed MP4 is the format YouTube gates least, adaptive audio
+// is often gated, and the remaining HLS playlist comes last.
 function directCandidates(ios, android) {
   const list = [];
+  const iosHls = ios?.streamingData?.hlsManifestUrl;
+  if (iosHls) list.push({ source: 'ios-hls', url: iosHls, format: 'hls', size: 0, isHls: true });
   const progressive = pickProgressiveFormat(android?.streamingData);
   if (progressive?.url) list.push({ source: 'android-progressive', url: progressive.url, format: 'mp4', size: directSize(progressive), isHls: false });
   const androidAudio = pickBestAudio(android?.streamingData);
   if (androidAudio?.url) list.push({ source: 'android-audio', url: androidAudio.url, format: 'm4a', size: directSize(androidAudio), isHls: false });
   const iosAudio = pickBestAudio(ios?.streamingData);
   if (iosAudio?.url) list.push({ source: 'ios-audio', url: iosAudio.url, format: 'm4a', size: directSize(iosAudio), isHls: false });
-  if (android?.streamingData?.hlsManifestUrl) list.push({ source: 'android-hls', url: android.streamingData.hlsManifestUrl, format: 'hls', size: 0, isHls: true });
-  if (ios?.streamingData?.hlsManifestUrl) list.push({ source: 'ios-hls', url: ios.streamingData.hlsManifestUrl, format: 'hls', size: 0, isHls: true });
+  const androidHls = android?.streamingData?.hlsManifestUrl;
+  if (androidHls) list.push({ source: 'android-hls', url: androidHls, format: 'hls', size: 0, isHls: true });
   return list;
 }
 async function resolveDirectFallback(trackId, env, userToken) {
@@ -1240,16 +1238,6 @@ async function handleStream(trackId, env, userToken, wantVideo = false) {
   }
 }
 
-// Eclipsemusic.app/docs: codec/container/manifest are optional, but when they
-// are present the apps pick a playback engine before the first byte instead of
-// probing the file. Leaving them out is what let a track end up on an engine
-// that could not scrub it. Our audio is always AAC in an MP4 container.
-function streamRoutingFields(result) {
-  const isHls = result.format === 'hls' || /mpegurl|m3u8/i.test(result.url);
-  if (isHls) return { codec: 'aac', container: 'fmp4', manifest: 'hls', encrypted: false };
-  return { codec: 'aac', container: 'mp4', manifest: 'none', encrypted: false };
-}
-
 async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
   // Always try all 9 clients (2.9.10 reverted a PO-gated skip after
   // production logs showed AndroidNative resolving fine with zero bot
@@ -1307,8 +1295,7 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
         // Only an explicit refusal costs us the attempt; 'unknown' (timeout,
         // network hiccup) is accepted, since an unverified URL beats none.
         if (resolver.name !== 'Direct') {
-          const declaredSize = Number(new URL(result.url).searchParams.get('clen')) || 0;
-          const verdict = await directCheck({ url: result.url, isHls: result.format === 'hls', size: declaredSize });
+          const verdict = await directCheck({ url: result.url, isHls: result.format === 'hls', size: 0 });
           if (verdict === 'bad') {
             console.log(LOG_PREFIX, resolver.name + ' returned a gated link for ' + trackId + ' — trying next client');
             continue;
@@ -1317,7 +1304,6 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
         }
         console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}`);
         result.expiresAt = urlExpirySeconds(result.url);
-        Object.assign(result, streamRoutingFields(result));
         if (videoTask) {
           // Never let an optional field hold the reply: 250 ms or nothing.
           const video = await Promise.race([videoTask, new Promise(r => setTimeout(() => r(null), 250))]);
@@ -1554,7 +1540,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.15', description: v.description,
+    id: v.id, name: v.name, version: '2.9.16', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
