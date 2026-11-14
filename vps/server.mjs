@@ -1045,6 +1045,7 @@ const server = http.createServer((req, res) => {
   const hls = /^hls\/([A-Za-z0-9_-]{6,20})\/(playlist\.m3u8|init|media)$/.exec(prefixPath);
   if (hls) {
     const id = hls[1];
+    console.log(new Date().toISOString(), 'hls', hls[2], id, '"' + String(req.headers['user-agent'] || '').slice(0, 70) + '"');
     if (hls[2] === 'playlist.m3u8') {
       hlsFor(id).then(
         (built) => {
