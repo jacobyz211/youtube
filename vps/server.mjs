@@ -15,10 +15,17 @@
 // 403 after roughly 1 MiB, which is what made tracks stall halfway. A single
 // one-byte request for the last byte tells the two apart, so a limited URL is
 // rejected while it is still cheap and the next client is asked instead.
+//
+// Why bytes are pulled in 2 MiB ranges rather than one long request: googlevideo
+// throttles a single long-lived read from a datacenter address down to a trickle
+// (measured at 0.5 KB/s, so a 50 MB track never finished and the player skipped
+// it). Re-opening the range every 2 MiB keeps the same address and the same
+// signed URL, and measures ~5 MB/s.
 
 import http from 'node:http';
 import https from 'node:https';
 import { execFile } from 'node:child_process';
+import { once } from 'node:events';
 
 const PORT = Number(process.env.PORT || 8080);
 const SECRET = process.env.YTM_SECRET || '';
@@ -29,6 +36,10 @@ const COOKIE = process.env.YTM_COOKIE || '';
 // Used only when every InnerTube client has been challenged or hands back a
 // limited URL.
 const YTDLP = process.env.YTM_YTDLP ?? '/home/ubuntu/.local/bin/yt-dlp';
+// Chunk size for the media read. Small enough that the CDN keeps serving at
+// full speed, large enough that one request covers ~2 minutes of audio.
+const CHUNK_BYTES = Number(process.env.YTM_CHUNK_BYTES || 2 << 20);
+const MAX_REMINTS = 2;
 
 if (!SECRET || SECRET.length < 16) {
   console.error('YTM_SECRET must be set to at least 16 characters');
@@ -283,7 +294,7 @@ function ytdlpUrl(videoId, format) {
     `https://www.youtube.com/watch?v=${videoId}`,
   ];
   return new Promise((resolve, reject) => {
-    execFile(YTDLP, args, { timeout: 60000, maxBuffer: 1 << 20 }, (err, stdout) => {
+    execFile(YTDLP, args, { timeout: 25000, maxBuffer: 1 << 20 }, (err, stdout) => {
       if (err) return reject(err);
       const url = String(stdout).split('\n').map((l) => l.trim()).find((l) => l.startsWith('http'));
       if (!url) return reject(new Error('yt-dlp returned no url'));
@@ -293,7 +304,7 @@ function ytdlpUrl(videoId, format) {
 }
 
 async function fromYtDlp(videoId) {
-  for (const format of ['bestaudio[ext=m4a]', 'bestaudio']) {
+  for (const format of ['bestaudio[ext=m4a]/bestaudio']) {
     try {
       const audio = await ytdlpUrl(videoId, format);
       const res = await request(audio, { headers: { range: 'bytes=0-0', 'user-agent': WEB_UA } });
@@ -355,7 +366,12 @@ async function resolve(videoId) {
     }
   }
 
-  const fallback = await fromYtDlp(videoId);
+  // Every client saying the video is unavailable means it is gone, not that we
+  // were challenged. yt-dlp agrees, so skip its two-second spawn and let the
+  // player move on.
+  const gone = errors.length >= CLIENTS.length && errors.every((e) => e.includes('UNPLAYABLE'));
+
+  const fallback = gone ? null : await fromYtDlp(videoId);
   if (fallback) {
     memoSet(videoId, fallback);
     console.log(new Date().toISOString(), 'yt-dlp resolved', videoId, fallback.total || '');
@@ -393,92 +409,162 @@ function parseRange(header, total) {
   return { start, end: end !== null && end < start ? start : end };
 }
 
+function openChunk(target, ua, start, end) {
+  return request(target, {
+    method: 'GET',
+    headers: { range: `bytes=${start}-${end}`, 'user-agent': ua, origin: 'https://www.youtube.com' },
+    timeout: 20000,
+    follow: 3,
+  });
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function streamMedia(req, res, kind, videoId) {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    let entry;
-    try {
-      entry = await resolveOnce(videoId);
-    } catch (e) {
-      res.writeHead(502, { 'content-type': 'text/plain' });
-      res.end('resolve failed: ' + e.message);
-      return;
-    }
+  // A player that goes away mid-track must not take the process with it.
+  res.on('error', () => {});
+  req.on('error', () => {});
 
-    const target = kind === 'video' ? entry.video : entry.audio;
-    if (!target) {
-      res.writeHead(404, { 'content-type': 'text/plain' });
-      res.end(`no ${kind} for ${videoId}`);
-      return;
-    }
-
-    const total = entry.total || null;
-    const range = parseRange(req.headers.range, total);
-    let start = range ? range.start : 0;
-    let end = range ? range.end : null;
-    if (total !== null) {
-      if (start >= total) {
-        res.writeHead(416, { 'content-range': `bytes */${total}` });
-        res.end();
-        return;
-      }
-      if (end === null || end > total - 1) end = total - 1;
-    }
-    if (end === null) end = start + (8 << 20) - 1;
-
-    let upstream;
-    try {
-      upstream = await request(target, {
-        method: 'GET',
-        headers: { range: `bytes=${start}-${end}`, 'user-agent': entry.ua, origin: 'https://www.youtube.com' },
-        timeout: 30000,
-        follow: 3,
-      });
-    } catch (e) {
-      res.writeHead(504, { 'content-type': 'text/plain' });
-      res.end('cdn fetch failed: ' + e.message);
-      return;
-    }
-
-    if (upstream.status === 403 || upstream.status === 401) {
-      upstream.stream.resume();
-      memo.delete(videoId);
-      console.log(new Date().toISOString(), 'cdn', upstream.status, 're-minting', videoId);
-      continue;
-    }
-    if (upstream.status !== 200 && upstream.status !== 206) {
-      upstream.stream.resume();
-      res.writeHead(502, { 'content-type': 'text/plain' });
-      res.end('cdn status ' + upstream.status);
-      return;
-    }
-
-    const headers = {
-      'content-type': upstream.headers['content-type'] || (kind === 'video' ? 'video/mp4' : 'audio/mp4'),
-      'accept-ranges': 'bytes',
-      'access-control-allow-origin': '*',
-      // Never let an intermediary keep a copy of a signed URL's bytes.
-      'cache-control': 'no-store',
-    };
-    if (range) {
-      headers['content-range'] = upstream.headers['content-range'] || `bytes ${start}-${end}/${total ?? '*'}`;
-      res.writeHead(206, headers);
-    } else {
-      if (total !== null) headers['content-length'] = String(total);
-      else if (upstream.headers['content-length']) headers['content-length'] = upstream.headers['content-length'];
-      res.writeHead(upstream.status === 206 && total === null ? 206 : 200, headers);
-    }
-
-    if (req.method === 'HEAD') {
-      upstream.stream.resume();
-      res.end();
-      return;
-    }
-    upstream.stream.pipe(res);
+  let entry;
+  try {
+    entry = await resolveOnce(videoId);
+  } catch (e) {
+    res.writeHead(502, { 'content-type': 'text/plain' });
+    res.end('resolve failed: ' + e.message);
     return;
   }
 
-  res.writeHead(502, { 'content-type': 'text/plain' });
-  res.end('cdn kept rejecting the signed url');
+  const pick = () => (kind === 'video' ? entry.video : entry.audio);
+  if (!pick()) {
+    res.writeHead(404, { 'content-type': 'text/plain' });
+    res.end(`no ${kind} for ${videoId}`);
+    return;
+  }
+
+  const total = entry.total || null;
+  const range = total !== null ? parseRange(req.headers.range, total) : null;
+  let start = range ? range.start : 0;
+  let end = range ? range.end : null;
+  if (total !== null) {
+    if (start >= total) {
+      res.writeHead(416, { 'content-range': `bytes */${total}` });
+      res.end();
+      return;
+    }
+    if (end === null || end > total - 1) end = total - 1;
+  }
+
+  // Declare the length up front: the player sizes its buffer from it, and a
+  // chunked reply with no length is what some players sit and wait on.
+  const headers = {
+    'content-type': kind === 'video' ? 'video/mp4' : 'audio/mp4',
+    'accept-ranges': 'bytes',
+    'access-control-allow-origin': '*',
+    // Never let an intermediary keep a copy of a signed URL's bytes.
+    'cache-control': 'no-store',
+  };
+  if (range && total !== null) {
+    headers['content-range'] = `bytes ${start}-${end}/${total}`;
+  } else if (total !== null) {
+    headers['content-length'] = String(end - start + 1);
+  }
+  res.writeHead(range && total !== null ? 206 : 200, headers);
+
+  if (req.method === 'HEAD') {
+    res.end();
+    return;
+  }
+
+  let pos = start;
+  let remints = 0;
+  let retries = 0;
+
+  while (total === null || pos <= end) {
+    const chunkEnd = total === null ? pos + CHUNK_BYTES - 1 : Math.min(pos + CHUNK_BYTES - 1, end);
+    const want = chunkEnd - pos + 1;
+
+    let upstream;
+    try {
+      upstream = await openChunk(pick(), entry.ua, pos, chunkEnd);
+    } catch (e) {
+      if (retries++ < 2) {
+        await sleep(150 * retries);
+        continue;
+      }
+      console.log(new Date().toISOString(), 'chunk fetch failed', videoId, pos, e.message);
+      break;
+    }
+
+    // A signed URL can be rejected partway through a long track. Buying a fresh
+    // one and carrying on from the same offset keeps the player's connection.
+    if (upstream.status === 401 || upstream.status === 403) {
+      upstream.stream.resume();
+      if (remints++ < MAX_REMINTS) {
+        console.log(new Date().toISOString(), 'cdn', upstream.status, 're-minting', videoId, 'at', pos);
+        memo.delete(videoId);
+        retries = 0;
+        try {
+          entry = await resolveOnce(videoId);
+        } catch {
+          break;
+        }
+        continue;
+      }
+      console.log(new Date().toISOString(), 'cdn kept rejecting', videoId, pos);
+      break;
+    }
+
+    if (upstream.status !== 200 && upstream.status !== 206) {
+      upstream.stream.resume();
+      if (retries++ < 2) {
+        await sleep(150 * retries);
+        continue;
+      }
+      console.log(new Date().toISOString(), 'chunk status', upstream.status, videoId, pos);
+      break;
+    }
+
+    // Only byte 0 of a 200 answer is trustworthy: the host ignored the range.
+    if (upstream.status === 200 && pos !== 0) {
+      upstream.stream.resume();
+      break;
+    }
+
+    let got = 0;
+    let failed = false;
+    try {
+      for await (const buf of upstream.stream) {
+        if (res.destroyed) {
+          upstream.stream.destroy();
+          return;
+        }
+        got += buf.length;
+        if (!res.write(buf)) await once(res, 'drain');
+      }
+    } catch {
+      failed = true;
+    }
+
+    if (res.destroyed) return;
+    pos += got;
+
+    // 200 means the host sent the whole file, so there is nothing left to ask for.
+    if (upstream.status === 200) break;
+
+    // Short or empty chunk: the CDN dropped the connection, so ask again from
+    // the byte we actually reached rather than handing the player a hole.
+    if (got < want) {
+      if (retries++ >= 3) {
+        console.log(new Date().toISOString(), 'chunk stalled', videoId, pos, failed ? 'error' : 'short');
+        break;
+      }
+      await sleep(120);
+      continue;
+    }
+    retries = 0;
+  }
+
+  res.end();
 }
 
 const server = http.createServer((req, res) => {
@@ -506,6 +592,20 @@ const server = http.createServer((req, res) => {
   if (prefixPath === 'health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, warp: WARP_LOCAL_ADDR, clients: CLIENTS.map((c) => c.name) }));
+    return;
+  }
+
+  // The Worker calls this the moment a track is selected, so the player call
+  // finishes while the app is still opening the stream. Shares the same memo,
+  // so it never costs a second resolve.
+  const warm = /^prewarm\/([A-Za-z0-9_-]{6,20})$/.exec(prefixPath);
+  if (warm) {
+    resolveOnce(warm[1]).then(
+      () => {},
+      () => {}
+    );
+    res.writeHead(202, { 'content-type': 'application/json' });
+    res.end('{"warming":true}');
     return;
   }
 

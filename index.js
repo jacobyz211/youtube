@@ -1,5 +1,10 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.11.0 — media served by a single-IP proxy
+// author: ricky | version: 2.12.0 — chunked reads + prewarmed playback
+//
+// WHAT CHANGED IN 2.12.0 — the proxy throttles a single long read, so long
+// tracks stalled and were skipped. /stream now also asks the proxy to resolve
+// the track in the background, so the player call is already done by the time
+// the player asks for bytes. See vps/server.mjs.
 //
 // WHAT CHANGED IN 2.11.0 — the bytes are fetched by a one-file proxy on a VPS
 // with a fixed address, because Cloudflare rotates egress IPs between the mint
@@ -1074,7 +1079,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.11.0', description: v.description,
+    id: v.id, name: v.name, version: '2.12.0', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
@@ -1276,7 +1281,7 @@ async function checkEclipseAccess(request) {
 function eclipseAccessDeniedResponse() {
   return jsonRes({ error: "Unavailable" }, 403);
 }
-async function handleRoute(rest, url, request, env, userToken, mode) {
+async function handleRoute(rest, url, request, env, userToken, mode, ctx) {
   const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
   // Settings capability: Eclipse appends declared setting keys as query params
   // on every request. `searchMode` overrides the URL-path mode when present,
@@ -1312,7 +1317,16 @@ if (ECLIPSE_GATED_PREFIXES.some((p) => rest === p || rest.startsWith(p + "/"))) 
   if (!eclipseClaims) return eclipseAccessDeniedResponse();
 }
   if (rest === '/search') return jsonRes(await handleSearch(q, env, userToken, effectiveMode));
-  if (rest.startsWith('/stream/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleStream(id, env, userToken, env?.PUBLIC_BASE_URL || url.origin)); }
+  if (rest.startsWith('/stream/')) {
+    const id = lastSegment(rest);
+    if (!id) return jsonRes({ error: 'Missing ID' }, 400);
+    // YouTube takes 0.4–3 s to hand back a playable URL, and the player asks for
+    // the bytes the instant this reply lands. Resolving it in the background
+    // now (same in-RAM entry, so it is not a second player call) is what makes
+    // pressing play feel immediate.
+    if (ctx?.waitUntil) ctx.waitUntil(fetch(`${MEDIA_PROXY}/prewarm/${encodeURIComponent(id)}`, { method: 'POST' }).catch(() => {}));
+    return jsonRes(await handleStream(id, env, userToken, env?.PUBLIC_BASE_URL || url.origin));
+  }
   // Media bytes are served by this Worker, not by googlevideo: the signed CDN
   // URL is only valid from the IP that minted it. These two are deliberately
   // not behind the Eclipse gate — a player fetching an audio URL does not send
@@ -1453,7 +1467,7 @@ function reCopy(){const v=document.getElementById('savedUrl').value.trim();if(v)
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -1477,7 +1491,7 @@ export default {
     if (parsed) {
       if (!isValidToken(parsed.token)) return jsonRes({ error: 'Invalid token' }, 400);
       try {
-        const result = await handleRoute(parsed.rest, url, request, env, parsed.token, parsed.mode);
+        const result = await handleRoute(parsed.rest, url, request, env, parsed.token, parsed.mode, ctx);
         if (result) return result;
       } catch (e) {
         console.log(LOG_PREFIX, 'Route error:', e.message);
@@ -1487,7 +1501,7 @@ export default {
     }
 
     try {
-      const result = await handleRoute(path, url, request, env, null, 'both');
+      const result = await handleRoute(path, url, request, env, null, 'both', ctx);
       if (result) return result;
     } catch (e) {
       console.log(LOG_PREFIX, 'Bare route error:', e.message);
