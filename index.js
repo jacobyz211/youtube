@@ -1,5 +1,21 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.12 (VISIONOS client added)
+// author: ricky | version: 2.9.13 (fast skips, shared resolves)
+// Changes from 2.9.12:
+//   - /stream no longer stalls the queue. Three separate causes, all removed:
+//       * the optional `video` lookup was awaited on the success path, adding
+//         up to three player calls to every reply. It now runs alongside the
+//         audio chain and is capped at 250 ms after audio resolves;
+//       * every reply is a fresh resolve, so swiping spent one call (or ten)
+//         per track and YouTube answered the burst with bot checks. Finished
+//         resolves are now reused for six minutes from RAM only, and a second
+//         request for the same track joins the one already running;
+//       * the chain always started at VisionOS. The client that worked last
+//         is now tried first, so a queue pays no failed-attempt sleeps;
+//   - A failing /stream now answers 503 + Retry-After: 1 instead of 500, which
+//     is what Eclipse retries. A 500 is treated as fatal and leaves the
+//     player spinning on that track forever.
+//   - Progressive audio is picked before an HLS manifest, so playback starts
+//     on the first byte rather than after a playlist is parsed.
 // Changes from 2.9.10:
 //   - FIX: tryRefreshPoToken() sent a bare GET to YT_PO_TOKEN_GENERATOR_URL.
 //     Real BotGuard-attestation PO token generators — e.g. bgutil-ytdlp-pot-
@@ -912,19 +928,23 @@ async function resolveAndroidMusic(trackId, env, userToken) {
 // NEW (2.9.8): TVHTML5 — different fingerprint family (TV surface).
 async function resolveTV(trackId, env, userToken) {
   const data = await fetchPlayerDataTV(trackId, env, userToken);
-  const hlsUrl = data?.streamingData?.hlsManifestUrl;
-  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  // Progressive audio first: a plain file needs no playlist parsing, and the
+  // app starts it on the first byte instead of after the manifest.
   const best = pickBestAudio(data?.streamingData);
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  const hlsUrl = data?.streamingData?.hlsManifestUrl;
+  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
   throw new Error('no usable format');
 }
 // NEW (2.9.8): TVHTML5_SIMPLY_EMBEDDED_PLAYER — TV-embed variant.
 async function resolveTVEmbedded(trackId, env, userToken) {
   const data = await fetchPlayerDataTVEmbedded(trackId, env, userToken);
-  const hlsUrl = data?.streamingData?.hlsManifestUrl;
-  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  // Progressive audio first: a plain file needs no playlist parsing, and the
+  // app starts it on the first byte instead of after the manifest.
   const best = pickBestAudio(data?.streamingData);
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  const hlsUrl = data?.streamingData?.hlsManifestUrl;
+  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
   throw new Error('no usable format');
 }
 // ── Video support (ADDITIVE ONLY — eclipsemusic.app/docs "Video Playback") ──
@@ -993,26 +1013,32 @@ async function resolveIOS(trackId, env, userToken) {
 }
 async function resolveMWeb(trackId, env, userToken) {
   const data = await fetchPlayerDataMWeb(trackId, env, userToken);
-  const hlsUrl = data?.streamingData?.hlsManifestUrl;
-  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  // Progressive audio first: a plain file needs no playlist parsing, and the
+  // app starts it on the first byte instead of after the manifest.
   const best = pickBestAudio(data?.streamingData);
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  const hlsUrl = data?.streamingData?.hlsManifestUrl;
+  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
   throw new Error('no usable format');
 }
 async function resolveWebCreator(trackId, env, userToken) {
   const data = await fetchPlayerDataWebCreator(trackId, env, userToken);
-  const hlsUrl = data?.streamingData?.hlsManifestUrl;
-  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  // Progressive audio first: a plain file needs no playlist parsing, and the
+  // app starts it on the first byte instead of after the manifest.
   const best = pickBestAudio(data?.streamingData);
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  const hlsUrl = data?.streamingData?.hlsManifestUrl;
+  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
   throw new Error('no usable format');
 }
 async function resolveWebEmbedded(trackId, env, userToken) {
   const data = await fetchPlayerDataWebEmbedded(trackId, env, userToken);
-  const hlsUrl = data?.streamingData?.hlsManifestUrl;
-  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  // Progressive audio first: a plain file needs no playlist parsing, and the
+  // app starts it on the first byte instead of after the manifest.
   const best = pickBestAudio(data?.streamingData);
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
+  const hlsUrl = data?.streamingData?.hlsManifestUrl;
+  if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
   throw new Error('no usable format');
 }
 async function resolveAndroidVR(trackId, env, userToken) {
@@ -1034,7 +1060,24 @@ async function resolveVisionOS(trackId, env, userToken) {
 // 6 simultaneous player API calls from the same IP and blocked them all as
 // "Sign in to confirm you're not a bot". Now: try one at a time, return on
 // first success. Best case = 1 API call, worst case = 6 (but sequential).
-async function handleStream(trackId, env, userToken) {
+async function handleStream(trackId, env, userToken, wantVideo = false) {
+  const memo = memoGet(trackId);
+  if (memo) return memo;
+  const already = resolveInflight.get(trackId);
+  if (already) return already;
+
+  const task = resolveStreamOnce(trackId, env, userToken, wantVideo);
+  resolveInflight.set(trackId, task);
+  try {
+    const result = await task;
+    memoPut(trackId, result);
+    return result;
+  } finally {
+    resolveInflight.delete(trackId);
+  }
+}
+
+async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
   // Always try all 9 clients (2.9.10 reverted a PO-gated skip after
   // production logs showed AndroidNative resolving fine with zero bot
   // errors even without a PO token — see changelog above).
@@ -1059,27 +1102,37 @@ async function handleStream(trackId, env, userToken) {
     { name: 'TVEmbedded', run: () => resolveTVEmbedded(trackId, env, userToken) },
     { name: 'AndroidVR', run: () => resolveAndroidVR(trackId, env, userToken) },
   ];
+  // Sticky ordering: whatever client resolved the previous track is tried
+  // first. On a queue it removes the failed-attempt sleep from almost every
+  // song, and it stops re-walking a chain whose leading clients are being
+  // bot-checked right now.
+  if (preferredClient) {
+    const at = resolvers.findIndex((r) => r.name === preferredClient);
+    if (at > 0) resolvers.unshift(...resolvers.splice(at, 1));
+  }
+
+  // Video (ADDITIVE ONLY) runs alongside the audio chain rather than after it.
+  // It used to be awaited on the success path, which added up to three player
+  // calls to every single /stream — the app wants an answer inside 3 seconds.
+  const videoTask = wantVideo
+    ? fetchVideoInfo(trackId, env, userToken).catch(() => null)
+    : null;
+
   for (let i = 0; i < resolvers.length; i++) {
     const resolver = resolvers[i];
-    // FIX (2.9.7): small randomized delay before each fallback attempt.
-    // Firing back-to-back player-API calls from the same Workers IP with
-    // zero spacing is itself a machine-pattern signature, independent of
-    // which client each call claims to be. Only sleep BETWEEN attempts
-    // (never before the first) so the common case — first resolver
-    // succeeds — pays no extra latency.
-    if (i > 0) await new Promise(r => setTimeout(r, 150 + Math.floor(Math.random() * 250)));
+    // Small randomized delay between fallback attempts only. Firing player
+    // calls back-to-back is itself a machine-pattern signature.
+    if (i > 0) await new Promise(r => setTimeout(r, 80 + Math.floor(Math.random() * 120)));
     try {
       const result = await resolver.run();
       if (result) {
+        preferredClient = resolver.name;
         console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}`);
-        // ADDITIVE ONLY: try to attach a `video` object (eclipsemusic.app/docs
-        // "Video Playback"). This is wrapped so it can never affect or block
-        // the audio result above — worst case, `video` is just left unset.
-        try {
-          const video = await fetchVideoInfo(trackId, env, userToken);
+        result.expiresAt = urlExpirySeconds(result.url);
+        if (videoTask) {
+          // Never let an optional field hold the reply: 250 ms or nothing.
+          const video = await Promise.race([videoTask, new Promise(r => setTimeout(() => r(null), 250))]);
           if (video) result.video = video;
-        } catch (e) {
-          console.log(LOG_PREFIX, `video attach skipped for ${trackId}:`, e.message);
         }
         return result;
       }
@@ -1088,6 +1141,43 @@ async function handleStream(trackId, env, userToken) {
     }
   }
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
+}
+
+// ── Resolve memo, RAM only ────────────────────────────────────────────────────
+// Swiping through a queue used to spend a full player call — and on a bad run,
+// ten of them with a sleep between each — per track, so YouTube answered the
+// burst with bot checks and the next song sat on "loading". A finished resolve
+// is therefore reused for a few minutes, and two requests for the same track
+// (a skip landing on a track the app is already prefetching) share one call.
+// Nothing is written to disk or to Redis: this dies with the isolate.
+const RESOLVE_TTL_MS = 6 * 60 * 1000;
+const MAX_MEMO = 200;
+const resolveMemo = new Map();     // trackId -> { at, result }
+const resolveInflight = new Map(); // trackId -> Promise
+let preferredClient = null;        // the client that worked last time
+
+// A googlevideo link carries its own expiry; handing one out that is about to
+// lapse is what makes a track fail a second after it started.
+function urlExpirySeconds(u) {
+  try {
+    const t = Number(new URL(u).searchParams.get('expire'));
+    if (Number.isFinite(t) && t > 0) return t;
+  } catch {}
+  return Math.floor(Date.now() / 1000) + 6 * 3600;
+}
+
+function memoGet(trackId) {
+  const hit = resolveMemo.get(trackId);
+  if (!hit) return null;
+  const stale = Date.now() - hit.at > RESOLVE_TTL_MS;
+  const expiring = hit.result?.expiresAt && hit.result.expiresAt * 1000 < Date.now() + 60 * 1000;
+  if (stale || expiring) { resolveMemo.delete(trackId); return null; }
+  return hit.result;
+}
+
+function memoPut(trackId, result) {
+  if (resolveMemo.size >= MAX_MEMO) resolveMemo.delete(resolveMemo.keys().next().value);
+  resolveMemo.set(trackId, { at: Date.now(), result });
 }
 
 async function proxyDownload(trackId, incomingRequest, env, userToken) {
@@ -1275,7 +1365,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.12', description: v.description,
+    id: v.id, name: v.name, version: '2.9.13', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
@@ -1513,7 +1603,31 @@ if (ECLIPSE_GATED_PREFIXES.some((p) => rest === p || rest.startsWith(p + "/"))) 
   if (!eclipseClaims) return eclipseAccessDeniedResponse();
 }
   if (rest === '/search') return jsonRes(await handleSearch(q, env, userToken, effectiveMode));
-  if (rest.startsWith('/stream/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleStream(id, env, userToken)); }
+  if (rest.startsWith('/stream/')) {
+    const id = lastSegment(rest);
+    if (!id) return jsonRes({ error: 'Missing ID' }, 400);
+    const startedAt = Date.now();
+    try {
+      const body = await handleStream(id, env, userToken, effectiveMode !== 'songs');
+      // Visible in `wrangler tail`: a skip that took 3 s shows up as one line.
+      console.log(LOG_PREFIX, `stream ${id} in ${Date.now() - startedAt}ms via ${body?.format || '?'}`);
+      return jsonRes(body);
+    } catch (e) {
+      // Answer retryably instead of hanging: Eclipse honours Retry-After, so a
+      // track whose clients are all bot-checked this second is retried a second
+      // later instead of leaving the player spinning.
+      console.log(LOG_PREFIX, `stream unavailable for ${id}: ${e.message}`);
+      return new Response(JSON.stringify({ error: 'Not ready' }), {
+        status: 503,
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          'access-control-allow-origin': '*',
+          'cache-control': 'no-store',
+          'retry-after': '1',
+        },
+      });
+    }
+  }
   if (rest.startsWith('/download/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return await proxyDownload(id, request, env, userToken); }
   if (rest.startsWith('/album/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleAlbum(id, env, userToken)); }
   if (rest.startsWith('/artist/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleArtist(id, env, userToken, effectiveMode)); }
