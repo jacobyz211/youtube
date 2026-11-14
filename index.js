@@ -1,5 +1,18 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.14 (verified links + direct fallback)
+// author: ricky | version: 2.9.15 (seekable replies)
+// Changes from 2.9.14:
+//   - SEEKING. googlevideo serves byte ranges correctly (206 at 50% and 95%),
+//     so the refusal was ours, not theirs. Two causes fixed:
+//       * /stream sent no codec/container/manifest, so Eclipse had to guess a
+//         playback engine by probing the file; the guess can land on one that
+//         will not scrub. Replies now say aac / mp4 / manifest none, or
+//         aac / fmp4 / hls for a playlist;
+//       * resolveIOS returned the HLS manifest whenever it won the chain, and
+//         googlevideo's HLS is the least seekable thing it serves. It now
+//         prefers the plain audio file and only falls back to HLS.
+//   - The verification probe now reads at ~60% of the file (it reads the size
+//     from the URL's own clen parameter), so a link that plays from the start
+//     but refuses a mid-song range is rejected instead of handed out.
 // Changes from 2.9.13:
 //   - ADOPTED from the working "YouTube Music Direct" module (nvmindl, v5.3):
 //     a link is now VERIFIED before it is handed out. A PO-token-gated
@@ -1018,9 +1031,14 @@ async function fetchVideoInfo(trackId, env, userToken) {
 }
 async function resolveIOS(trackId, env, userToken) {
   const data = await fetchPlayerData(trackId, env, userToken);
+  // Audio file first, HLS only if there is nothing else. googlevideo's HLS is
+  // the least seekable thing it serves — scrubbing it stalls or snaps back —
+  // and it was what this resolver handed out whenever it won the chain.
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   const hlsUrl = data?.streamingData?.hlsManifestUrl;
   if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
-  throw new Error('no HLS');
+  throw new Error('no usable format');
 }
 async function resolveMWeb(trackId, env, userToken) {
   const data = await fetchPlayerDataMWeb(trackId, env, userToken);
@@ -1222,6 +1240,16 @@ async function handleStream(trackId, env, userToken, wantVideo = false) {
   }
 }
 
+// Eclipsemusic.app/docs: codec/container/manifest are optional, but when they
+// are present the apps pick a playback engine before the first byte instead of
+// probing the file. Leaving them out is what let a track end up on an engine
+// that could not scrub it. Our audio is always AAC in an MP4 container.
+function streamRoutingFields(result) {
+  const isHls = result.format === 'hls' || /mpegurl|m3u8/i.test(result.url);
+  if (isHls) return { codec: 'aac', container: 'fmp4', manifest: 'hls', encrypted: false };
+  return { codec: 'aac', container: 'mp4', manifest: 'none', encrypted: false };
+}
+
 async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
   // Always try all 9 clients (2.9.10 reverted a PO-gated skip after
   // production logs showed AndroidNative resolving fine with zero bot
@@ -1279,7 +1307,8 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
         // Only an explicit refusal costs us the attempt; 'unknown' (timeout,
         // network hiccup) is accepted, since an unverified URL beats none.
         if (resolver.name !== 'Direct') {
-          const verdict = await directCheck({ url: result.url, isHls: result.format === 'hls', size: 0 });
+          const declaredSize = Number(new URL(result.url).searchParams.get('clen')) || 0;
+          const verdict = await directCheck({ url: result.url, isHls: result.format === 'hls', size: declaredSize });
           if (verdict === 'bad') {
             console.log(LOG_PREFIX, resolver.name + ' returned a gated link for ' + trackId + ' — trying next client');
             continue;
@@ -1288,6 +1317,7 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
         }
         console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}`);
         result.expiresAt = urlExpirySeconds(result.url);
+        Object.assign(result, streamRoutingFields(result));
         if (videoTask) {
           // Never let an optional field hold the reply: 250 ms or nothing.
           const video = await Promise.race([videoTask, new Promise(r => setTimeout(() => r(null), 250))]);
@@ -1524,7 +1554,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.14', description: v.description,
+    id: v.id, name: v.name, version: '2.9.15', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
