@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.16.0 — replies carry their length
+// author: ricky | version: 2.17.0 — replies carry their length
 //
 // WHAT CHANGED IN 2.16.0 — a seeked start (Range: bytes=0-) came back as a
 // chunked 206 with no Content-Length, and a player with no length to size a
@@ -1292,7 +1292,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.16.0', description: v.description,
+    id: v.id, name: v.name, version: '2.17.0', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
