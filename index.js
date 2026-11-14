@@ -1,5 +1,10 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.10.3 — proxied bytes, Range-always upstream
+// author: ricky | version: 2.11.0 — media served by a single-IP proxy
+//
+// WHAT CHANGED IN 2.11.0 — the bytes are fetched by a one-file proxy on a VPS
+// with a fixed address, because Cloudflare rotates egress IPs between the mint
+// and the fetch and the signature is bound to the minting address. /stream no
+// longer resolves anything, so a track costs one player call instead of three.
 //
 // WHAT CHANGED IN 2.10.3 — the CDN signs these URLs with rqh=1 (range
 // required), so a plain GET with no Range header was rejected and surfaced as
@@ -824,44 +829,25 @@ async function resolveTrack(trackId, env, userToken) {
 // IMPORTANT: the CDN URL is signed for the IP that minted it (sparams includes
 // ip, and the signature covers it), so handing it to a listener's phone yields
 // 403. Both audio and video are therefore served from this Worker instead.
+// No player call here. Eclipse asks for /stream immediately before it asks for
+// the media URL, and the media URL is resolved by the proxy anyway; resolving in
+// both places doubled the request volume for no benefit and is what tripped
+// YouTube's "confirm you're not a bot" challenge.
+const STREAM_TTL_SEC = 6 * 3600;
+
 function buildStreamResponse(trackId, entry, origin) {
   const base = (origin || '').replace(/\/+$/, '');
-  if (entry.format === 'hls') {
-    // HLS segments are on the CDN too and cannot be proxied without rewriting
-    // the playlist, so this path only exists as a fallback.
-    return {
-      url: entry.url,
-      format: 'hls',
-      quality: entry.quality || 'auto',
-      codec: 'aac',
-      container: 'fmp4',
-      manifest: 'hls',
-      expiresAt: entry.expiresAt,
-    };
-  }
-  const body = {
+  return {
     url: `${base}/audio/${trackId}`,
     format: 'm4a',
-    quality: entry.quality || 'native',
+    quality: 'native',
     codec: 'aac',
     container: 'mp4',
-    manifest: 'none',
-    expiresAt: entry.expiresAt,
+    expiresAt: Math.floor(Date.now() / 1000) + STREAM_TTL_SEC,
   };
-  if (entry.video?.url) {
-    body.video = {
-      url: `${base}/video/${trackId}`,
-      mimeType: 'video/mp4',
-      muxed: true,
-      width: entry.video.width || 0,
-      height: entry.video.height || 0,
-    };
-  }
-  return body;
 }
 
 async function handleStream(trackId, env, userToken, origin) {
-  const entry = await resolveTrack(trackId, env, userToken);
   return buildStreamResponse(trackId, entry, origin);
 }
 
@@ -876,68 +862,53 @@ const CDN_HEADERS = {
   'Referer': 'https://music.youtube.com/',
 };
 
+// The bytes are fetched by a single-IP box, not by this Worker. googlevideo
+// signs a URL for the address that minted it, and Cloudflare rotates its egress
+// address between subrequests, so minting and fetching from here intermittently
+// 403s. One machine doing both is the only way this is reliably correct.
+const MEDIA_PROXY = 'http://15.204.247.1:8080/k7f2q9w4e1r8t5y3u6i0o2p4a6s8d0g2';
+
 async function proxyMedia(trackId, kind, incomingRequest, env, userToken) {
-  const wantsVideo = kind === 'video';
   const method = incomingRequest.method === 'HEAD' ? 'HEAD' : 'GET';
   const clientRange = incomingRequest.headers.get('range');
-  // googlevideo signs these URLs with rqh=1 ("range required"): fetching one
-  // without a Range header is rejected outright, which is what made a plain
-  // GET — exactly what a player does first — fail with a 500. Ask for the whole
-  // file explicitly instead.
-  const upstreamRange = clientRange || 'bytes=0-';
+  const target = `${MEDIA_PROXY}/${kind}/${encodeURIComponent(trackId)}`;
 
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const entry = await resolveTrack(trackId, env, userToken);
-    const target = wantsVideo ? entry.video?.url : entry.url;
-    if (!target) {
-      if (wantsVideo) continue; // another client may expose a muxed video
-      throw new Error(`${LOG_PREFIX} no ${kind} source for ${trackId}`);
-    }
+  const upstream = await fetch(target, {
+    method,
+    headers: clientRange ? { range: clientRange } : {},
+  });
 
-    const headers = { ...CDN_HEADERS, Range: upstreamRange };
-    if (env?.YT_COOKIE) headers.Cookie = env.YT_COOKIE;
-
-    const upstream = await fetch(target, { method, headers });
-
-    // 403 from the CDN means the signature was minted for a different egress
-    // address than this fetch used. Mint a new one and try again.
-    if (upstream.status === 403 || upstream.status === 401) {
-      console.log(LOG_PREFIX, `${kind} ${upstream.status} for ${trackId} — re-minting URL (attempt ${attempt + 1})`);
-      continue;
-    }
-    if (!upstream.ok && upstream.status !== 206) {
-      throw new Error(`${LOG_PREFIX} CDN ${upstream.status} for ${trackId}`);
-    }
-
-    const contentRange = upstream.headers.get('content-range') || '';
-    const total = /\/(\d+)\s*$/.exec(contentRange)?.[1];
-    let status = upstream.status;
-    let outLength = upstream.headers.get('content-length');
-    let outRange = contentRange;
-
-    // The client asked for the whole file, so answer 200 with the total length
-    // rather than leaking our internal "bytes=0-" as a 206.
-    if (!clientRange && status === 206) {
-      status = 200;
-      if (total) outLength = total;
-      outRange = '';
-    }
-
-    const out = {
-      'content-type': wantsVideo ? 'video/mp4' : 'audio/mp4',
-      'accept-ranges': 'bytes',
-      'access-control-allow-origin': '*',
-      'access-control-allow-methods': 'GET, HEAD, OPTIONS',
-      'access-control-allow-headers': 'Range, If-Range, Content-Type',
-      'access-control-expose-headers': 'Content-Range, Content-Length, Accept-Ranges',
-      'cache-control': 'private, max-age=3600',
-    };
-    if (outLength) out['content-length'] = outLength;
-    if (outRange) out['content-range'] = outRange;
-
-    return new Response(method === 'HEAD' ? null : upstream.body, { status, headers: out });
+  if (!upstream.ok && upstream.status !== 206) {
+    const detail = await upstream.text().catch(() => '');
+    throw new Error(`${LOG_PREFIX} media ${upstream.status} for ${trackId}${detail ? ' — ' + detail.slice(0, 200) : ''}`);
   }
-  throw new Error(`${LOG_PREFIX} CDN kept rejecting the signed URL for ${trackId}`);
+
+  let status = upstream.status;
+  let length = upstream.headers.get('content-length');
+  let contentRange = upstream.headers.get('content-range') || '';
+
+  // No Range was asked for, so present the whole file as 200 rather than
+  // leaking the proxy's internal "bytes=0-" as a 206.
+  if (!clientRange && status === 206) {
+    status = 200;
+    const total = /\/(\d+)\s*$/.exec(contentRange)?.[1];
+    if (total) length = total;
+    contentRange = '';
+  }
+
+  const out = {
+    'content-type': kind === 'video' ? 'video/mp4' : 'audio/mp4',
+    'accept-ranges': 'bytes',
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, HEAD, OPTIONS',
+    'access-control-allow-headers': 'Range, If-Range, Content-Type',
+    'access-control-expose-headers': 'Content-Range, Content-Length, Accept-Ranges',
+    'cache-control': 'private, max-age=3600',
+  };
+  if (length) out['content-length'] = length;
+  if (contentRange) out['content-range'] = contentRange;
+
+  return new Response(method === 'HEAD' ? null : upstream.body, { status, headers: out });
 }
 
 async function proxyDownload(trackId, incomingRequest, env, userToken) {
@@ -1103,7 +1074,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.10.3', description: v.description,
+    id: v.id, name: v.name, version: '2.11.0', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
