@@ -792,7 +792,7 @@ async function resolveTrack(trackId, env, userToken) {
 // ip, and the signature covers it), so handing it to a listener's phone yields
 // 403. Both audio and video are therefore served from this Worker instead.
 function buildStreamResponse(trackId, entry, origin) {
-  const base = origin || '';
+  const base = (origin || '').replace(/\/+$/, '');
   if (entry.format === 'hls') {
     // HLS segments are on the CDN too and cannot be proxied without rewriting
     // the playlist, so this path only exists as a fallback.
