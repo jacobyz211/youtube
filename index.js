@@ -1,5 +1,16 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.13 (fast skips, shared resolves)
+// author: ricky | version: 2.9.14 (verified links + direct fallback)
+// Changes from 2.9.13:
+//   - ADOPTED from the working "YouTube Music Direct" module (nvmindl, v5.3):
+//     a link is now VERIFIED before it is handed out. A PO-token-gated
+//     googlevideo URL answers 206 for its first megabyte and 403 after it, so
+//     a probe at byte 0 passes on links that die a minute into the song. The
+//     probe starts past 1 MiB; a gated verdict costs one attempt and the chain
+//     moves on, while 'unknown' (timeout) is accepted.
+//   - NEW last resort resolver Direct, also from that module: it asks iOS and
+//     Android together, ranks every source they carry (muxed MP4 first,
+//     adaptive audio, then HLS) and probes them in rank order, then repeats
+//     once with a fresh visitor because bot verdicts are per-visitor.
 // Changes from 2.9.12:
 //   - /stream no longer stalls the queue. Three separate causes, all removed:
 //       * the optional `video` lookup was awaited on the success path, adding
@@ -1055,6 +1066,140 @@ async function resolveVisionOS(trackId, env, userToken) {
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
 }
+// ── NEW (2.9.14): DIRECT FALLBACK, ported from "YouTube Music Direct" ─────────
+// The working Eclipse module (nvmindl, v5.3) resolves from the phone instead of
+// from a Worker, but two of its ideas carry over exactly and the chain above
+// does neither:
+//   1. ask iOS and Android TOGETHER and keep both answers, then rank every
+//      source they carry instead of settling for whichever client replied
+//      first. Muxed MP4 leads (the format YouTube gates least), adaptive audio
+//      next, HLS last;
+//   2. verify the winner before handing it out. A PO-token-gated googlevideo
+//      link serves the first megabyte happily and only then answers 403, so a
+//      probe at byte 0 passes on links that die a minute into the song. The
+//      probe therefore starts past 1 MiB.
+// This is a LAST resort: it only runs once every cheaper identity has failed,
+// and it repeats once with a fresh visitor, since bot verdicts are per-visitor.
+const GATED_PREVIEW_BYTES = 1024 * 1024;
+const DIRECT_PROBE_TIMEOUT_MS = 2500;
+
+function directProbeOffset(size) {
+  const pastGate = GATED_PREVIEW_BYTES + 64 * 1024;
+  if (!size) return pastGate;
+  if (size > pastGate + 64 * 1024) return Math.max(pastGate, Math.floor(size * 0.6));
+  return Math.max(0, size - 2);
+}
+function directSize(format) {
+  const exact = Number(format.contentLength);
+  if (exact > 0) return exact;
+  const bitrate = Number(format.averageBitrate || format.bitrate) || 0;
+  const durationMs = Number(format.approxDurationMs) || 0;
+  return Math.floor(bitrate * durationMs / 8000);
+}
+function directStatusClass(status) {
+  if (status === 200 || status === 206) return 'ok';
+  if (status === 401 || status === 403 || status === 404 || status === 410) return 'bad';
+  return 'unknown';
+}
+async function directFetch(url, headers) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DIRECT_PROBE_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, { headers, signal: controller.signal });
+    const total = Number((resp.headers.get('content-range') || '').match(/\/(\d+)$/)?.[1]) || 0;
+    return { status: resp.status, total, resp };
+  } catch {
+    return { status: 0, total: 0, resp: null };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function directProbe(url, offset) {
+  const out = await directFetch(url, { Range: `bytes=${offset}-${offset + 1}` });
+  try { await out.resp?.body?.cancel(); } catch {}
+  return out;
+}
+// 'ok' = playable, 'bad' = YouTube refused it, 'unknown' = could not tell.
+async function directCheckFile(media) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    let probed = await directProbe(media.url, directProbeOffset(media.size));
+    // The size estimate overshot the file; probe again inside its real length.
+    if (probed.status === 416 && probed.total) {
+      probed = await directProbe(media.url, directProbeOffset(probed.total));
+    }
+    const verdict = directStatusClass(probed.status);
+    if (verdict !== 'unknown') return verdict;
+    if (attempt === 1) await new Promise(r => setTimeout(r, 200));
+  }
+  return 'unknown';
+}
+async function directPlaylist(url) {
+  const out = await directFetch(url, {});
+  const text = out.resp?.ok ? (await out.resp.text().catch(() => '')).trim() : '';
+  return { status: out.status, text };
+}
+async function directCheckHls(media) {
+  const master = await directPlaylist(media.url);
+  if (directStatusClass(master.status) !== 'ok') return directStatusClass(master.status);
+  if (!master.text.startsWith('#EXTM3U')) return 'bad';
+  if (master.text.includes('#EXTINF')) return 'ok';
+  const variantUrl = master.text.split('\n').map(l => l.trim()).find(l => /^https?:\/\//.test(l));
+  if (!variantUrl) return 'bad';
+  const variant = await directPlaylist(variantUrl);
+  if (directStatusClass(variant.status) !== 'ok') return directStatusClass(variant.status);
+  return variant.text.includes('#EXTINF') ? 'ok' : 'bad';
+}
+function directCheck(media) {
+  return media.isHls ? directCheckHls(media) : directCheckFile(media);
+}
+function directCandidates(ios, android) {
+  const list = [];
+  const progressive = pickProgressiveFormat(android?.streamingData);
+  if (progressive?.url) list.push({ source: 'android-progressive', url: progressive.url, format: 'mp4', size: directSize(progressive), isHls: false });
+  const androidAudio = pickBestAudio(android?.streamingData);
+  if (androidAudio?.url) list.push({ source: 'android-audio', url: androidAudio.url, format: 'm4a', size: directSize(androidAudio), isHls: false });
+  const iosAudio = pickBestAudio(ios?.streamingData);
+  if (iosAudio?.url) list.push({ source: 'ios-audio', url: iosAudio.url, format: 'm4a', size: directSize(iosAudio), isHls: false });
+  if (android?.streamingData?.hlsManifestUrl) list.push({ source: 'android-hls', url: android.streamingData.hlsManifestUrl, format: 'hls', size: 0, isHls: true });
+  if (ios?.streamingData?.hlsManifestUrl) list.push({ source: 'ios-hls', url: ios.streamingData.hlsManifestUrl, format: 'hls', size: 0, isHls: true });
+  return list;
+}
+async function resolveDirectFallback(trackId, env, userToken) {
+  let unverified = null;
+  for (let round = 1; round <= 2; round++) {
+    if (round > 1) {
+      await upstashCmd(env, 'DEL', userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor');
+      await new Promise(r => setTimeout(r, 250));
+    }
+    const [ios, android] = await Promise.all([
+      fetchPlayerData(trackId, env, userToken).catch((e) => { console.log(LOG_PREFIX, `Direct: ios player failed for ${trackId}:`, e.message); return null; }),
+      fetchPlayerDataAndroid(trackId, env, userToken).catch((e) => { console.log(LOG_PREFIX, `Direct: android player failed for ${trackId}:`, e.message); return null; }),
+    ]);
+    const candidates = directCandidates(ios, android);
+    if (!candidates.length) {
+      console.log(LOG_PREFIX, `Direct: no candidates for ${trackId} (round ${round})`);
+      continue;
+    }
+    // Probe everything at once, but settle in rank order, so a slow low-ranked
+    // probe never holds up a verified better one.
+    const verdicts = candidates.map(directCheck);
+    for (let i = 0; i < candidates.length; i++) {
+      const verdict = await verdicts[i];
+      if (verdict === 'ok') {
+        console.log(LOG_PREFIX, `Direct: using ${candidates[i].source} for ${trackId} (probe ok)`);
+        return { url: candidates[i].url, format: candidates[i].format, quality: 'native' };
+      }
+      console.log(LOG_PREFIX, `Direct: ${candidates[i].source} for ${trackId} probe=${verdict}`);
+      if (verdict === 'unknown' && !unverified) unverified = candidates[i];
+    }
+  }
+  // The network was too unreliable to verify anything; an unverified URL beats none.
+  if (unverified) {
+    console.log(LOG_PREFIX, `Direct: using unverified ${unverified.source} for ${trackId}`);
+    return { url: unverified.url, format: unverified.format, quality: 'native' };
+  }
+  throw new Error('direct fallback found no source');
+}
 // ── FIX: Sequential stream resolution instead of parallel ──────────────
 // Previously: Promise.allSettled fired all 6 resolvers at once, YouTube saw
 // 6 simultaneous player API calls from the same IP and blocked them all as
@@ -1101,6 +1246,8 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
     { name: 'TV', run: () => resolveTV(trackId, env, userToken) },
     { name: 'TVEmbedded', run: () => resolveTVEmbedded(trackId, env, userToken) },
     { name: 'AndroidVR', run: () => resolveAndroidVR(trackId, env, userToken) },
+    // Ported last resort — see the DIRECT FALLBACK block above.
+    { name: 'Direct', run: () => resolveDirectFallback(trackId, env, userToken) },
   ];
   // Sticky ordering: whatever client resolved the previous track is tried
   // first. On a queue it removes the failed-attempt sleep from almost every
@@ -1126,7 +1273,19 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
     try {
       const result = await resolver.run();
       if (result) {
-        preferredClient = resolver.name;
+        // Verify before handing it out: a PO-token-gated link answers 206 at
+        // byte 0 and 403 a megabyte in, which is a track that starts and then
+        // dies — or never starts, depending on where the player seeks first.
+        // Only an explicit refusal costs us the attempt; 'unknown' (timeout,
+        // network hiccup) is accepted, since an unverified URL beats none.
+        if (resolver.name !== 'Direct') {
+          const verdict = await directCheck({ url: result.url, isHls: result.format === 'hls', size: 0 });
+          if (verdict === 'bad') {
+            console.log(LOG_PREFIX, resolver.name + ' returned a gated link for ' + trackId + ' — trying next client');
+            continue;
+          }
+          preferredClient = resolver.name;
+        }
         console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}`);
         result.expiresAt = urlExpirySeconds(result.url);
         if (videoTask) {
@@ -1365,7 +1524,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.13', description: v.description,
+    id: v.id, name: v.name, version: '2.9.14', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
