@@ -427,54 +427,115 @@ async function fromYtDlp(videoId) {
   return null;
 }
 
+// No single resolve may take longer than this, no matter what the video lookup
+// is doing. A track that needs more simply starts without video.
+const RESOLVE_BUDGET_MS = 900;
+
+function raceBudget(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => {
+      const t = setTimeout(() => resolve(null), ms);
+      if (t.unref) t.unref();
+    }),
+  ]);
+}
+
+// One shared ANDROID player call per track, started the moment a resolve begins.
+// The muxed rendition only exists in ANDROID's response, so without this the
+// video lookup ran a second player call after the audio had already resolved,
+// and that call sat directly on the path between tapping a song and hearing it.
+// Sharing it means the call overlaps the race instead of following it, and the
+// race reuses the same answer when ANDROID is itself the winner.
+const androidInflight = new Map();
+const ANDROID_REUSE_MS = 60 * 1000;
+
+function androidPlayer(videoId) {
+  const hit = androidInflight.get(videoId);
+  if (hit && hit.exp > Date.now()) return hit.p;
+  const android = CLIENTS.find((c) => c.name === 'ANDROID');
+  const p = player(android, videoId).catch((e) => {
+    androidInflight.delete(videoId);
+    throw e;
+  });
+  if (androidInflight.size > 50) androidInflight.delete(androidInflight.keys().next().value);
+  androidInflight.set(videoId, { p, exp: Date.now() + ANDROID_REUSE_MS });
+  return p;
+}
+
+// The muxed rendition for a track that has video. Never throws: a track that
+// cannot produce one is still perfectly playable as audio.
+async function findMuxed(sd, client, videoId) {
+  const own = (sd.formats || [])
+    .filter((f) => f.url && String(f.mimeType || '').startsWith('video/mp4'))
+    .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+  try {
+    let muxed = own || null;
+    let muxedUa = client.ua;
+
+    if (!muxed) {
+      const android = CLIENTS.find((c) => c.name === 'ANDROID');
+      const sd2 = await androidPlayer(videoId);
+      const cand = (sd2.formats || []).find((f) => f.url && String(f.mimeType || '').startsWith('video/mp4'));
+      if (cand) {
+        const probe = await servesWholeFile(cand.url, android.ua, Number(cand.contentLength) || null);
+        if (probe.ok) {
+          muxed = cand;
+          muxedUa = android.ua;
+          if (probe.total) cand.contentLength = probe.total;
+        } else {
+          console.log(new Date().toISOString(), 'muxed video rejected', videoId);
+        }
+      }
+    }
+
+    // A muxed format taken straight from this client's response often has no
+    // contentLength, and without a length the player cannot seek the video.
+    if (muxed && !muxed.contentLength) {
+      const own2 = await servesWholeFile(muxed.url, muxedUa, null);
+      if (own2.total) muxed.contentLength = own2.total;
+    }
+
+    return { muxed, muxedUa };
+  } catch (e) {
+    console.log(new Date().toISOString(), 'no muxed video', videoId, e.message.slice(0, 60));
+    return { muxed: own || null, muxedUa: client.ua };
+  }
+}
+
 // One client's whole attempt: player call, pick the audio, prove the URL streams,
 // and find the muxed rendition the player can show as video.
 async function attemptClient(client, videoId) {
+  const startedAt = Date.now();
   try {
-    const sd = await player(client, videoId);
+    const sd = client.name === 'ANDROID' ? await androidPlayer(videoId) : await player(client, videoId);
     const audio = rankAudio(sd.adaptiveFormats || [])[0];
     if (!audio) throw new Error('no audio format');
     const total = Number(audio.contentLength) || null;
-
-    if (!(await servesWholeFile(audio.url, client.ua, total)).ok) {
-      console.log(new Date().toISOString(), 'limited url', videoId, client.name);
-      return { limited: true, err: `${client.name} limited url` };
-    }
 
     // Eclipse plays video only when /stream offers it, and it wants one file with
     // picture AND sound ("muxed"). VISIONOS and IOS answer with adaptive formats
     // only, which are video-only, so a track that has video may cost one more
     // player call to ANDROID, which still returns the muxed 360p rendition.
+    //
+    // This starts BEFORE the audio probe and is awaited after it: the two are
+    // independent, and doing them in sequence is what made video tracks start
+    // about a second later than audio-only ones.
     const hasVideo = (sd.adaptiveFormats || []).some((f) => String(f.mimeType || '').startsWith('video/'));
-    let muxed = (sd.formats || [])
-      .filter((f) => f.url && String(f.mimeType || '').startsWith('video/mp4'))
-      .sort((a, b) => (b.height || 0) - (a.height || 0))[0] || null;
-    let muxedUa = client.ua;
+    const videoTask = hasVideo ? findMuxed(sd, client, videoId).catch(() => null) : null;
 
-    // A muxed format taken straight from this client's response often has no
-    // contentLength, and without a length the player cannot seek the video.
-    if (muxed && !muxed.contentLength) {
-      const own = await servesWholeFile(muxed.url, muxedUa, null);
-      if (own.total) muxed.contentLength = own.total;
+    const probe = await servesWholeFile(audio.url, client.ua, total);
+    if (!probe.ok) {
+      console.log(new Date().toISOString(), 'limited url', videoId, client.name);
+      return { limited: true, err: `${client.name} limited url` };
     }
 
-    if (!muxed && hasVideo) {
-      const android = CLIENTS.find((c) => c.name === 'ANDROID');
-      try {
-        const sd2 = await player(android, videoId);
-        const cand = (sd2.formats || []).find((f) => f.url && String(f.mimeType || '').startsWith('video/mp4'));
-        const probe = cand ? await servesWholeFile(cand.url, android.ua, Number(cand.contentLength) || null) : null;
-        if (cand && probe.ok) {
-          muxed = cand;
-          muxedUa = android.ua;
-          if (probe.total) cand.contentLength = probe.total;
-        } else if (cand) {
-          console.log(new Date().toISOString(), 'muxed video rejected', videoId);
-        }
-      } catch (e) {
-        console.log(new Date().toISOString(), 'no muxed video', videoId, e.message.slice(0, 60));
-      }
-    }
+    // The video rendition is a nice-to-have; hearing the song is not. It gets a
+    // slice of the total resolve budget, so a slow or unavailable muxed format
+    // cannot hold playback up the way a one-second wait on every track did.
+    const videoLeft = startedAt + RESOLVE_BUDGET_MS - Date.now();
+    const videoInfo = videoTask && videoLeft > 60 ? await raceBudget(videoTask, videoLeft) : null;
+    const { muxed, muxedUa } = videoInfo || { muxed: null, muxedUa: client.ua };
 
     return {
       val: {
@@ -536,6 +597,10 @@ async function raceClients(videoId) {
     });
     launchTimer = setTimeout(() => launch(i + 1), CLIENT_STAGGER_MS);
   };
+
+  // Start the shared ANDROID call alongside the race so the video lookup is
+  // already done by the time audio wins. Failure is fine: it is only video.
+  androidPlayer(videoId).catch(() => {});
 
   launch(0);
   const val = await won;
@@ -810,6 +875,7 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify(body));
     };
+    const startedAt = Date.now();
     resolveOnce(warm[1]).then(
       (entry) =>
         reply({
@@ -819,8 +885,12 @@ const server = http.createServer((req, res) => {
           height: entry.videoHeight || 0,
           total: entry.total || 0,
           videoTotal: entry.videoTotal || 0,
+          // Diagnostics: which client won and how long the resolve took, so a
+          // slow track can be identified instead of guessed at.
+          client: entry.client || '',
+          ms: Date.now() - startedAt,
         }),
-      (e) => reply({ ok: false, error: String(e.message || e).slice(0, 200) })
+      (e) => reply({ ok: false, error: String(e.message || e).slice(0, 200), ms: Date.now() - startedAt })
     );
     return;
   }

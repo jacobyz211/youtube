@@ -99,6 +99,28 @@ media URL, which is bound to this address. The player then asks for `/audio/<id>
 a moment later and finds the URL already done, because both share the in-flight
 map: it is the same resolve, not a second player call.
 
+The reply also carries `client` and `ms` so a slow track can be identified from
+the response instead of guessed at.
+
+## Speed
+
+Clients are raced, not walked in order: one is launched every 120 ms and the
+first that produces a URL which actually streams wins, so the wait is set by the
+fastest client rather than by the slowest failure. Measured over 22 chart tracks:
+220–923 ms per cold resolve, median about 370 ms.
+
+No single resolve may run past `RESOLVE_BUDGET_MS` (900 ms). Resolving a track
+means a player call, a probe that proves the URL streams, and a lookup for the
+muxed video rendition; the video lookup gets whatever is left of the budget and
+otherwise the track starts without video rather than starting late.
+
+That video lookup used to run *after* the audio had already resolved, which put
+an extra player call directly between tapping a song and hearing it — about a
+second on tracks whose muxed format turned out to be unavailable anyway. The
+ANDROID call that produces the muxed rendition is now started once at the
+beginning of the resolve, shared with the race, and awaited in parallel with the
+audio probe.
+
 Eclipse only shows its video toggle for a track whose `/stream` reply carries a
 `video` object, and it wants **one file with picture and sound** (`muxed: true`).
 VISIONOS and IOS return adaptive formats only, which are video-only, so a track

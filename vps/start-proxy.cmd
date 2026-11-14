@@ -21,10 +21,19 @@ rem ping rather than `timeout`: timeout refuses to run when stdin is redirected,
 rem which is what happens if this is launched from a script.
 ping -n 3 127.0.0.1 >nul
 
-start "ytm-tunnel" /min ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -R 0.0.0.0:8081:127.0.0.1:8080 vps
+rem Only start a tunnel if one is not already forwarding: a second ssh to the
+rem same remote port fails and closes its window immediately.
+set HEALTH=http://15-204-247-1.sslip.io:8081/%YTM_SECRET%/health
+set CODE=
+for /f %%c in ('curl -s -m 4 -o NUL -w "%%{http_code}" %HEALTH%') do set CODE=%%c
+if "%CODE%"=="200" (
+  echo Tunnel already up.
+) else (
+  start "ytm-tunnel" /min ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -R 0.0.0.0:8081:127.0.0.1:8080 vps
+  echo Started the tunnel to the VPS on port 8081.
+)
 
 echo.
-echo Tunnel started: the VPS forwards port 8081 back to this laptop.
 echo Keep this machine awake while you listen. Close the two minimized
 echo windows ("ytm-proxy", "ytm-tunnel") to stop.
 ping -n 5 127.0.0.1 >nul
