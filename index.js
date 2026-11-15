@@ -1,5 +1,29 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.17 (client health)
+// author: ricky | version: 2.12.0 (SABR proxy)
+// Changes from 2.9.17 — a last-resort transport, nothing else touched:
+//   - NEW /sabr/<id>: audio streamed through YouTube's own SABR protocol
+//     (googlevideo's SabrStream, the same engine as InnerTubeX's sabr/
+//     package). This is the one transport that does not hand out a
+//     googlevideo URL — the thing that expires, is bound to the identity that
+//     asked, and answers 206 then 403 once that identity is flagged.
+//     Measured on a datacenter IP, same track, same minute: direct URL 403,
+//     SABR 200/200/200 and ~500 KB in 1.4 s.
+//   - /stream uses it only after every client in the chain has failed, and
+//     returns the proxy as `{ url: <origin>/sabr/<id>, quality: 'sabr' }`, so
+//     the reply shape Eclipse consumes is unchanged.
+//   - The proxy is never probed (a probe would open and throw away a session),
+//     it answers `accept-ranges: none` because a SABR session has no byte
+//     offsets to satisfy Range with, and it 503s with Retry-After if no
+//     identity can open one.
+//   - PO tokens come from the existing YT_PO_TOKEN_GENERATOR_URL when present;
+//     without a generator SABR still serves everything that does not need one.
+//   - Two Worker-runtime faults were found by streaming a real track through
+//     `wrangler dev` (Node never showed either): googlevideo calls the fetch it
+//     is handed as `this.fetchFunction(...)`, which workerd rejects as an
+//     illegal invocation, and a PO-token callback that resolves to null made
+//     the next segment request encode a null into the protobuf. sabr.js passes
+//     an arrow and turns an empty token into undefined. Verified end to end:
+//     a whole 3.4 MB track through the proxy in 1.5 s, no errors.
 // Changes from 2.9.16 — playback path untouched, chain behaviour only:
 //   - ADOPTED from InnerTubeX (MetrolistGroup/innertubex), whose
 //     ClientHealthMonitor records failures per client identity and stops
@@ -142,6 +166,8 @@
 //   - handleSearch: backfill only for empty categories, keeps all 6 search types
 //   - 8SPINE module support (async-free module code)
 
+import { openSabrAudio, sabrResponse, SABR_CLIENTS } from './sabr.js';
+
 const LOG_PREFIX = '[YTMusic]';
 const YTM_BASE = 'https://music.youtube.com';
 const YTM_API_KEY_FALLBACK = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -244,6 +270,31 @@ async function tryRefreshPoToken(env) {
   } catch (e) {
     console.log(LOG_PREFIX, 'PO token auto-refresh failed:', e.message);
   }
+}
+
+// BotGuard hands out base64url text; SABR carries the token as raw bytes in its
+// protobuf streamer context, so it has to be decoded before it is sent.
+function poTokenToBytes(token) {
+  try {
+    const normalized = String(token).replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+    const raw = atob(padded);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
+// Only called when the SABR server asks for an attestation mid-stream.
+async function mintPoTokenBytes(env) {
+  let token = await getPoToken(env);
+  if (!token && env?.YT_PO_TOKEN_GENERATOR_URL) {
+    await tryRefreshPoToken(env);
+    token = await getPoToken(env);
+  }
+  return token ? poTokenToBytes(token) : null;
 }
 async function upstashCmd(env, ...args) {
   const url = env?.UPSTASH_REDIS_REST_URL, token = env?.UPSTASH_REDIS_REST_TOKEN;
@@ -1234,13 +1285,13 @@ async function resolveDirectFallback(trackId, env, userToken) {
 // 6 simultaneous player API calls from the same IP and blocked them all as
 // "Sign in to confirm you're not a bot". Now: try one at a time, return on
 // first success. Best case = 1 API call, worst case = 6 (but sequential).
-async function handleStream(trackId, env, userToken, wantVideo = false) {
+async function handleStream(trackId, env, userToken, wantVideo = false, origin = '') {
   const memo = memoGet(trackId);
   if (memo) return memo;
   const already = resolveInflight.get(trackId);
   if (already) return already;
 
-  const task = resolveStreamOnce(trackId, env, userToken, wantVideo);
+  const task = resolveStreamOnce(trackId, env, userToken, wantVideo, origin);
   resolveInflight.set(trackId, task);
   try {
     const result = await task;
@@ -1251,7 +1302,7 @@ async function handleStream(trackId, env, userToken, wantVideo = false) {
   }
 }
 
-async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
+async function resolveStreamOnce(trackId, env, userToken, wantVideo, origin = '') {
   // Always try all 9 clients (2.9.10 reverted a PO-gated skip after
   // production logs showed AndroidNative resolving fine with zero bot
   // errors even without a PO token — see changelog above).
@@ -1338,6 +1389,19 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
       noteClientFailure(resolver.name, e.message);
       console.log(LOG_PREFIX, `${resolver.name} failed for ${trackId}: ${e.message}`);
     }
+  }
+  // Last resort: our own SABR proxy. No probe here on purpose — probing the
+  // proxy would open a session and immediately throw it away, and the point of
+  // this path is that it is the transport that survives when URLs do not.
+  if (origin) {
+    console.log(LOG_PREFIX, `every client failed for ${trackId} — handing out the SABR proxy`);
+    return {
+      url: `${origin}/sabr/${trackId}`,
+      format: 'm4a',
+      quality: 'sabr',
+      proxied: true,
+      expiresAt: Math.floor(Date.now() / 1000) + 6 * 3600,
+    };
   }
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
 }
@@ -1450,6 +1514,37 @@ async function proxyDownload(trackId, incomingRequest, env, userToken) {
   if (upstream.headers.get('content-range')) resHeaders['content-range'] = upstream.headers.get('content-range');
   if (upstream.headers.get('accept-ranges')) resHeaders['accept-ranges'] = upstream.headers.get('accept-ranges');
   return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
+}
+
+// ── SABR proxy (see sabr.js) ──────────────────────────────────────────────────
+// Serves the track as a plain audio stream. Only reached for tracks whose
+// direct URLs all failed — either every identity was refused, or every link it
+// produced was gated past the first megabyte.
+async function handleSabr(trackId, env, userToken) {
+  const attempts = [
+    { name: 'AndroidVR', fetchPlayer: () => fetchPlayerDataAndroidVR(trackId, env, userToken), clientInfo: SABR_CLIENTS.androidVR },
+    { name: 'iOS', fetchPlayer: () => fetchPlayerData(trackId, env, userToken), clientInfo: SABR_CLIENTS.ios },
+  ];
+  for (const attempt of attempts) {
+    try {
+      const data = await attempt.fetchPlayer();
+      const opened = openSabrAudio({
+        data,
+        videoId: trackId,
+        clientInfo: attempt.clientInfo,
+        mintPoToken: () => mintPoTokenBytes(env),
+      });
+      if (!opened) {
+        console.log(LOG_PREFIX, `SABR: ${attempt.name} reply carries no SABR session for ${trackId}`);
+        continue;
+      }
+      console.log(LOG_PREFIX, `SABR: ${attempt.name} streaming ${trackId} itag=${opened.itag}`);
+      return sabrResponse(opened);
+    } catch (e) {
+      console.log(LOG_PREFIX, `SABR: ${attempt.name} failed for ${trackId}: ${e.message}`);
+    }
+  }
+  return null;
 }
 
 function extractSecondaryTracks(data, fallbackArtist, fallbackAlbum, fallbackArtwork) {
@@ -1607,7 +1702,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.17', description: v.description,
+    id: v.id, name: v.name, version: '2.12.0', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
@@ -1839,7 +1934,7 @@ async function handleRoute(rest, url, request, env, userToken, mode) {
     });
   }
   if (rest === '/manifest.json' || rest === '/manifest') return jsonRes(buildManifest(mode));
-  const ECLIPSE_GATED_PREFIXES = ["/search", "/stream", "/download", "/album", "/artist", "/playlist"];
+  const ECLIPSE_GATED_PREFIXES = ["/search", "/stream", "/download", "/album", "/artist", "/playlist", "/sabr"];
 if (ECLIPSE_GATED_PREFIXES.some((p) => rest === p || rest.startsWith(p + "/"))) {
   const eclipseClaims = await checkEclipseAccess(request);
   if (!eclipseClaims) return eclipseAccessDeniedResponse();
@@ -1850,7 +1945,7 @@ if (ECLIPSE_GATED_PREFIXES.some((p) => rest === p || rest.startsWith(p + "/"))) 
     if (!id) return jsonRes({ error: 'Missing ID' }, 400);
     const startedAt = Date.now();
     try {
-      const body = await handleStream(id, env, userToken, effectiveMode !== 'songs');
+      const body = await handleStream(id, env, userToken, effectiveMode !== 'songs', url.origin);
       // Visible in `wrangler tail`: a skip that took 3 s shows up as one line.
       console.log(LOG_PREFIX, `stream ${id} in ${Date.now() - startedAt}ms via ${body?.format || '?'}`);
       return jsonRes(body);
@@ -1869,6 +1964,16 @@ if (ECLIPSE_GATED_PREFIXES.some((p) => rest === p || rest.startsWith(p + "/"))) 
         },
       });
     }
+  }
+  if (rest.startsWith('/sabr/')) {
+    const id = lastSegment(rest);
+    if (!id) return jsonRes({ error: 'Missing ID' }, 400);
+    const streamed = await handleSabr(id, env, userToken);
+    if (streamed) return streamed;
+    return new Response(JSON.stringify({ error: 'Not ready' }), {
+      status: 503,
+      headers: { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store', 'retry-after': '1' },
+    });
   }
   if (rest.startsWith('/download/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return await proxyDownload(id, request, env, userToken); }
   if (rest.startsWith('/album/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleAlbum(id, env, userToken)); }
