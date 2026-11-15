@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.13.1 (seekable proxy, fast chain, cookie everywhere)
+// author: ricky | version: 2.13.2 (seekable proxy, racing chain, cookie everywhere)
 // Changes from 2.9.17 — a last-resort transport, nothing else touched:
 //   - NEW /sabr/<id>: audio streamed through YouTube's own SABR protocol
 //     (googlevideo's SabrStream, the same engine as InnerTubeX's sabr/
@@ -42,6 +42,10 @@
 //     it with a different visitor is an invalid pair — YouTube answers as if
 //     no token was sent. The addon now adopts the generator's visitor while
 //     its token is live, and sends the generator's API key when configured.
+//   - THE CHAIN RACES. Eleven identities walked one after another was ten
+//     seconds of "preparing track" on a track YouTube refuses anyway; they now
+//     start staggered and the first answer wins (budget 2.5 s), and a track
+//     that was just refused is not re-walked for a minute.
 //   - COOKIE REACH. YT_COOKIE used to reach three of eleven player identities.
 //     It is now attached to every player, search and browse call, because on a
 //     datacenter IP the identities without it are the ones that fail.
@@ -1357,6 +1361,10 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo, origin = ''
   // URL is configured and nothing is cached — this only affects what gets
   // attached to each request via withPoToken(), never which/how many
   // clients get tried.
+  const refusedUntil = gatedMemo.get(trackId);
+  if (refusedUntil && refusedUntil > Date.now()) {
+    throw new Error(`${LOG_PREFIX} ${trackId} was refused by every client ${Math.round((Date.now() - (refusedUntil - GATED_MEMO_MS)) / 1000)}s ago — not retrying yet`);
+  }
   if (!(await getPoToken(env)) && env?.YT_PO_TOKEN_GENERATOR_URL) {
     await tryRefreshPoToken(env);
   }
@@ -1393,57 +1401,79 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo, origin = ''
     ? fetchVideoInfo(trackId, env, userToken).catch(() => null)
     : null;
 
+  // The chain RACES instead of queueing. Walking eleven identities one after
+  // another at a probe each is ten seconds of "preparing track" on a track
+  // YouTube is going to refuse anyway, and when every one of them refuses the
+  // listener just sees the spinner. Racing them means the answer — success or
+  // failure — arrives in about the time of the slowest of the first two.
+  //
+  // The identity that last worked keeps the head of the queue: it starts at
+  // once while the others are staggered, both to keep it first and because
+  // firing eleven player calls in the same instant is itself a machine
+  // signature (the stagger is the same one the old queue slept for).
   const resolveStartedAt = Date.now();
-  for (let i = 0; i < resolvers.length; i++) {
-    const resolver = resolvers[i];
-    // Eclipse wants an answer in seconds. Walking eleven identities at up to
-    // 2.5 s of probe each is what left tracks sitting on "preparing track"
-    // forever, so the chain gives up its turn and lets the proxy answer.
-    if (Date.now() - resolveStartedAt > RESOLVE_BUDGET_MS) {
-      console.log(LOG_PREFIX, `resolve budget spent for ${trackId} — falling through`);
-      break;
-    }
+  let settled = false;
+  const attempt = (resolver, index) => (async () => {
+    if (index > 0) await new Promise(r => setTimeout(r, 200 * index));
+    if (settled || Date.now() - resolveStartedAt > RESOLVE_BUDGET_MS) return null;
     // Skip an identity that was just refused, unless it is the last hope left.
     if (clientCoolingDown(resolver.name) && resolvers.some((r) => !clientCoolingDown(r.name))) {
       console.log(LOG_PREFIX, `${resolver.name} cooling down for ${trackId}`);
-      continue;
+      return null;
     }
-    // Small randomized delay between fallback attempts only. Firing player
-    // calls back-to-back is itself a machine-pattern signature.
-    if (i > 0) await new Promise(r => setTimeout(r, 80 + Math.floor(Math.random() * 120)));
     try {
       const result = await resolver.run();
-      if (result) {
-        // Verify before handing it out: a PO-token-gated link answers 206 at
-        // byte 0 and 403 a megabyte in, which is a track that starts and then
-        // dies — or never starts, depending on where the player seeks first.
-        // Only an explicit refusal costs us the attempt; 'unknown' (timeout,
-        // network hiccup) is accepted, since an unverified URL beats none.
-        if (resolver.name !== 'Direct') {
-          const verdict = await directCheck({ url: result.url, isHls: result.format === 'hls', size: 0 });
-          if (verdict === 'bad') {
+      if (!result) return null;
+      // Verify before handing it out: a PO-token-gated link answers 206 at
+      // byte 0 and 403 a megabyte in, which is a track that starts and then
+      // dies — or never starts, depending on where the player seeks first.
+      // Only an explicit refusal costs us the attempt; 'unknown' (timeout,
+      // network hiccup) is accepted, since an unverified URL beats none.
+      if (resolver.name !== 'Direct') {
+        const verdict = await directCheck({ url: result.url, isHls: result.format === 'hls', size: 0 });
+        if (verdict === 'bad') {
+          if (!settled) {
             console.log(LOG_PREFIX, resolver.name + ' returned a gated link for ' + trackId + ' — trying next client');
             // Gated twice in a row means the identity, not the track, is the
             // problem — let it cool down like a bot verdict.
             noteClientFailure(resolver.name, 'gated link');
-            continue;
           }
-          noteClientSuccess(resolver.name);
+          return null;
         }
-        console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}`);
-        result.expiresAt = urlExpirySeconds(result.url);
-        if (videoTask) {
-          // Never let an optional field hold the reply: 250 ms or nothing.
-          const video = await Promise.race([videoTask, new Promise(r => setTimeout(() => r(null), 250))]);
-          if (video) result.video = video;
-        }
-        return result;
       }
+      // A racer that finishes after the race is already won must not report a
+      // failure (it only got here because the winner was announced) or write
+      // over the winner's health record.
+      if (settled) return null;
+      settled = true;
+      if (resolver.name !== 'Direct') noteClientSuccess(resolver.name);
+      console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}`);
+      result.expiresAt = urlExpirySeconds(result.url);
+      if (videoTask) {
+        // Never let an optional field hold the reply: 250 ms or nothing.
+        const video = await Promise.race([videoTask, new Promise(r => setTimeout(() => r(null), 250))]);
+        if (video) result.video = video;
+      }
+      return result;
     } catch (e) {
-      noteClientFailure(resolver.name, e.message);
-      console.log(LOG_PREFIX, `${resolver.name} failed for ${trackId}: ${e.message}`);
+      if (!settled) {
+        noteClientFailure(resolver.name, e.message);
+        console.log(LOG_PREFIX, `${resolver.name} failed for ${trackId}: ${e.message}`);
+      }
+      return null;
     }
+  })();
+
+  // First success wins; the rest are left to settle on their own.
+  const pending = new Set(resolvers.map(attempt));
+  let winner = null;
+  while (pending.size) {
+    const first = await Promise.race([...pending].map((p) => p.then((v) => ({ p, v }))));
+    pending.delete(first.p);
+    if (first.v) { winner = first.v; break; }
   }
+  if (winner) return winner;
+  console.log(LOG_PREFIX, `resolve chain finished with no client for ${trackId} (${Date.now() - resolveStartedAt} ms)`);
   // Last resort: our own SABR proxy. The track is pulled and cached here, so
   // the URL handed out answers its first request immediately — and only gets a
   // URL if the pull actually succeeded, which is what stops the player from
@@ -1462,7 +1492,9 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo, origin = ''
     }
     console.log(LOG_PREFIX, `SABR proxy could not pull ${trackId} either`);
   }
-  throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
+  if (gatedMemo.size >= MAX_MEMO) gatedMemo.delete(gatedMemo.keys().next().value);
+  gatedMemo.set(trackId, Date.now() + GATED_MEMO_MS);
+  throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — every client and the SABR proxy were refused`);
 }
 
 // ── Resolve memo, RAM only ────────────────────────────────────────────────────
@@ -1474,7 +1506,12 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo, origin = ''
 // Nothing is written to disk or to Redis: this dies with the isolate.
 const RESOLVE_TTL_MS = 6 * 60 * 1000;
 // How long the client chain may spend before the SABR proxy answers instead.
-const RESOLVE_BUDGET_MS = 4000;
+const RESOLVE_BUDGET_MS = 2500;
+// A track YouTube has just refused is not asked again immediately. The player
+// retries a failed track several times, and each retry used to cost a full
+// chain — the countdown that the listener reads as "preparing track".
+const GATED_MEMO_MS = 60 * 1000;
+const gatedMemo = new Map(); // trackId -> moment it may be tried again
 const MAX_MEMO = 200;
 const resolveMemo = new Map();     // trackId -> { at, result }
 const resolveInflight = new Map(); // trackId -> Promise
@@ -1819,7 +1856,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.13.1', description: v.description,
+    id: v.id, name: v.name, version: '2.13.2', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
