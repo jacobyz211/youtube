@@ -1,5 +1,18 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.9.16 (playback restored)
+// author: ricky | version: 2.9.17 (client health)
+// Changes from 2.9.16 — playback path untouched, chain behaviour only:
+//   - ADOPTED from InnerTubeX (MetrolistGroup/innertubex), whose
+//     ClientHealthMonitor records failures per client identity and stops
+//     asking one that was just refused. A client that answered "Sign in to
+//     confirm you're not a bot" answered it for the next several requests, so
+//     the old chain paid a failed round trip on almost every track and kept
+//     the verdict warm. Failures are now counted per client: a bot verdict
+//     parks that identity for five minutes, two ordinary failures park it for
+//     ninety seconds, and a success clears it.
+//   - The sticky preferred client only leads while it is healthy; a cooling
+//     client goes back into the chain instead of the head of the queue.
+//   - The skip is advisory: if every identity is cooling down the chain runs
+//     anyway, so a bad minute can never make a track unplayable.
 // Changes from 2.9.15 — 2.9.15 stopped playback, so it is reverted in full:
 //   - resolveIOS hands out the HLS manifest first again, exactly like "YouTube
 //     Music Direct" (its PLAYBACK_ORDER leads with ios-hls). Preferring the
@@ -1269,7 +1282,9 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
   // first. On a queue it removes the failed-attempt sleep from almost every
   // song, and it stops re-walking a chain whose leading clients are being
   // bot-checked right now.
-  if (preferredClient) {
+  // A client that is currently cooling down does not get the head of the
+  // queue: the identity that worked last stays first only while it is healthy.
+  if (preferredClient && !clientCoolingDown(preferredClient)) {
     const at = resolvers.findIndex((r) => r.name === preferredClient);
     if (at > 0) resolvers.unshift(...resolvers.splice(at, 1));
   }
@@ -1283,6 +1298,11 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
 
   for (let i = 0; i < resolvers.length; i++) {
     const resolver = resolvers[i];
+    // Skip an identity that was just refused, unless it is the last hope left.
+    if (clientCoolingDown(resolver.name) && resolvers.some((r) => !clientCoolingDown(r.name))) {
+      console.log(LOG_PREFIX, `${resolver.name} cooling down for ${trackId}`);
+      continue;
+    }
     // Small randomized delay between fallback attempts only. Firing player
     // calls back-to-back is itself a machine-pattern signature.
     if (i > 0) await new Promise(r => setTimeout(r, 80 + Math.floor(Math.random() * 120)));
@@ -1298,9 +1318,12 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
           const verdict = await directCheck({ url: result.url, isHls: result.format === 'hls', size: 0 });
           if (verdict === 'bad') {
             console.log(LOG_PREFIX, resolver.name + ' returned a gated link for ' + trackId + ' — trying next client');
+            // Gated twice in a row means the identity, not the track, is the
+            // problem — let it cool down like a bot verdict.
+            noteClientFailure(resolver.name, 'gated link');
             continue;
           }
-          preferredClient = resolver.name;
+          noteClientSuccess(resolver.name);
         }
         console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}`);
         result.expiresAt = urlExpirySeconds(result.url);
@@ -1312,6 +1335,7 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo) {
         return result;
       }
     } catch (e) {
+      noteClientFailure(resolver.name, e.message);
       console.log(LOG_PREFIX, `${resolver.name} failed for ${trackId}: ${e.message}`);
     }
   }
@@ -1330,6 +1354,49 @@ const MAX_MEMO = 200;
 const resolveMemo = new Map();     // trackId -> { at, result }
 const resolveInflight = new Map(); // trackId -> Promise
 let preferredClient = null;        // the client that worked last time
+
+// ── Client health ─────────────────────────────────────────────────────────────
+// Modeled on InnerTubeX's ClientHealthMonitor (MetrolistGroup/innertubex,
+// extraction/PlayerClientDirector.kt): the Kotlin client records failures per
+// identity and stops asking a client that has just been refused, instead of
+// re-walking the same chain from the top on every track. A client that answers
+// "Sign in to confirm you're not a bot" keeps answering it for the next several
+// requests, so leading with it costs the app a failed round trip per song and
+// keeps the verdict warm.
+//
+// Advisory only: if every identity is cooling down the chain runs anyway, so a
+// bad minute can never turn into a track that will not play.
+const CLIENT_COOLDOWN_MS = 90 * 1000;
+const CLIENT_BLOCKED_COOLDOWN_MS = 5 * 60 * 1000;
+const CLIENT_FAILS_BEFORE_COOLDOWN = 2;
+const clientHealth = new Map(); // client name -> { fails, until }
+
+// Bot verdicts are per-identity and sticky; ordinary network errors are not.
+function clientBotBlocked(message) {
+  return /bot|sign in|login required|unusual traffic|captcha|not a robot/i.test(String(message || ''));
+}
+
+function noteClientFailure(name, message) {
+  const now = Date.now();
+  const prev = clientHealth.get(name) || { fails: 0, until: 0 };
+  const fails = prev.fails + 1;
+  const blocked = clientBotBlocked(message);
+  const cooling = blocked || fails >= CLIENT_FAILS_BEFORE_COOLDOWN;
+  clientHealth.set(name, {
+    fails,
+    until: cooling ? now + (blocked ? CLIENT_BLOCKED_COOLDOWN_MS : CLIENT_COOLDOWN_MS) : prev.until,
+  });
+}
+
+function noteClientSuccess(name) {
+  clientHealth.delete(name);
+  preferredClient = name;
+}
+
+function clientCoolingDown(name) {
+  const entry = clientHealth.get(name);
+  return !!entry && entry.until > Date.now();
+}
 
 // A googlevideo link carries its own expiry; handing one out that is about to
 // lapse is what makes a track fail a second after it started.
@@ -1540,7 +1607,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.9.16', description: v.description,
+    id: v.id, name: v.name, version: '2.9.17', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
