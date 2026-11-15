@@ -17,8 +17,13 @@
 // track, same moment: direct URL 403 once the identity was flagged, SABR
 // 200/200/200 and ~500 KB in 1.4 s.
 //
-// Output is a plain audio stream the player can consume, so this only ever
-// replaces a URL — never the reply shape.
+// ── Why this materializes instead of relaying ────────────────────────────────
+// A live SABR session has no byte offsets, so a relayed stream cannot answer a
+// Range request and always restarts at zero — measured behaviour: a player
+// that seeks pauses and never resumes. So the track is pulled whole (a 3.4 MB
+// song takes ~1.5 s), cached, and then served like any other file: real
+// Content-Length, real 206 responses, working seeks. The download is paid once
+// per track per edge, not once per byte range.
 
 import { SabrStream } from 'googlevideo/sabr-stream';
 
@@ -45,6 +50,10 @@ export const SABR_CLIENTS = {
     hl: 'en',
   },
 };
+
+// A 10-minute track at 160 kbps is ~12 MB; anything far past that is not a
+// song and must not be buffered in an isolate.
+export const SABR_MAX_BYTES = 32 * 1024 * 1024;
 
 /**
  * Pull the SABR bits out of a raw `/youtubei/v1/player` reply.
@@ -74,6 +83,7 @@ export function sabrParts(data) {
       audioTrackId: f.audioTrack?.audioTrackId || undefined,
       quality: f.quality || undefined,
       audioQuality: f.audioQuality || undefined,
+      contentLength: Number(f.contentLength) || 0,
     }));
   // AAC/MP4 first: it is the container every player in the ecosystem handles,
   // and the direct-URL chain next door only ever hands out audio/mp4. Opus is
@@ -89,17 +99,20 @@ export function sabrParts(data) {
   return { url, ustreamer, formats, audio };
 }
 
+function contentTypeFor(format) {
+  return format.mimeType.startsWith('audio/webm') ? 'audio/webm' : 'audio/mp4';
+}
+
 /**
- * Start an audio-only SABR session.
+ * Pull the whole track through SABR and return its bytes.
  *
  * `mintPoToken` is optional: it is called if the server asks for an
- * attestation mid-stream, and must resolve to the raw token bytes. Without a
- * generator wired up the session still runs for content that does not need
- * one — which, measured, is most of it.
+ * attestation mid-stream, and must resolve to the raw token bytes.
  */
-export function openSabrAudio({ data, videoId, clientInfo, mintPoToken }) {
+export async function materializeSabrTrack({ data, videoId, clientInfo, mintPoToken, maxBytes = SABR_MAX_BYTES }) {
   const parts = sabrParts(data);
-  if (!parts) return null;
+  if (!parts) throw new Error('reply carries no SABR session');
+  const best = parts.audio[0];
   const stream = new SabrStream({
     videoId,
     serverAbrStreamingUrl: parts.url,
@@ -121,60 +134,88 @@ export function openSabrAudio({ data, videoId, clientInfo, mintPoToken }) {
       ? { callbacks: { onMintPoToken: async () => (await mintPoToken()) || undefined } }
       : {}),
   });
-  const best = parts.audio[0];
   const { audioStream } = stream.start({
     audioFormat: best.itag,
     enabledTrackTypes: 1, // AUDIO_ONLY — video is a separate lookup in this addon
     isPostLiveDvr: false,
   });
-  return {
-    stream,
-    audioStream,
-    itag: best.itag,
-    contentType: best.mimeType.startsWith('audio/webm') ? 'audio/webm' : 'audio/mp4',
-  };
+  const reader = audioStream.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || !value.byteLength) continue;
+      total += value.byteLength;
+      if (total > maxBytes) throw new Error(`track exceeds ${maxBytes} bytes`);
+      chunks.push(value);
+    }
+  } finally {
+    try { await reader.cancel(); } catch {}
+    try { await stream.abort(); } catch {}
+  }
+  if (!total) throw new Error('SABR session produced no audio');
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { bytes, contentType: contentTypeFor(best), itag: best.itag, durationMs: Number(best.approxDurationMs) || 0 };
 }
 
 /**
- * Wrap a SABR audio stream in a Response the player can consume.
- *
- * A SABR session has no byte offsets to satisfy a Range header with, so the
- * body always starts at zero and `accept-ranges: none` says so honestly —
- * players then stream from the first byte instead of probing for a length that
- * does not exist yet. That is the one compromise versus a cached file, and this
- * path only runs when every direct URL failed.
+ * Parse a `Range: bytes=a-b` header against a known length.
+ * Returns null when the header is absent, unparseable, or asks for an
+ * unsatisfiable range — the caller then serves the whole file.
  */
-export function sabrResponse({ audioStream, stream, contentType }) {
-  const reader = audioStream.getReader();
-  const body = new ReadableStream({
-    start(controller) {
-      (async () => {
-        try {
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            controller.enqueue(value);
-          }
-          controller.close();
-        } catch (err) {
-          try { controller.error(err); } catch {}
-        }
-      })();
-    },
-    async cancel() {
-      try { await reader.cancel(); } catch {}
-      try { await stream.abort(); } catch {}
-    },
-  });
-  return new Response(body, {
+export function parseByteRange(header, total) {
+  if (!header) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(String(header).trim().split(',')[0]);
+  if (!match) return null;
+  const [, rawStart, rawEnd] = match;
+  if (rawStart === '' && rawEnd === '') return null;
+  let start;
+  let end;
+  if (rawStart === '') {
+    // Suffix form: bytes=-N means the last N bytes.
+    const suffix = Number(rawEnd);
+    if (!Number.isFinite(suffix) || suffix <= 0) return null;
+    start = Math.max(0, total - suffix);
+    end = total - 1;
+  } else {
+    start = Number(rawStart);
+    end = rawEnd === '' ? total - 1 : Math.min(Number(rawEnd), total - 1);
+  }
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= total) return null;
+  return { start, end };
+}
+
+/** Serve a complete audio file with working Range/seek support. */
+export function serveAudioBytes({ bytes, contentType, range, head = false }) {
+  const total = bytes.byteLength;
+  const headers = {
+    'content-type': contentType,
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, HEAD, OPTIONS',
+    'access-control-expose-headers': 'content-type, content-length, content-range, accept-ranges',
+    'accept-ranges': 'bytes',
+    'cache-control': 'no-store',
+  };
+  if (range) {
+    const slice = bytes.subarray(range.start, range.end + 1);
+    return new Response(head ? null : slice, {
+      status: 206,
+      headers: {
+        ...headers,
+        'content-length': String(slice.byteLength),
+        'content-range': `bytes ${range.start}-${range.end}/${total}`,
+      },
+    });
+  }
+  return new Response(head ? null : bytes, {
     status: 200,
-    headers: {
-      'content-type': contentType,
-      'access-control-allow-origin': '*',
-      'access-control-allow-methods': 'GET, OPTIONS',
-      'access-control-expose-headers': 'content-type',
-      'cache-control': 'no-store',
-      'accept-ranges': 'none',
-    },
+    headers: { ...headers, 'content-length': String(total) },
   });
 }

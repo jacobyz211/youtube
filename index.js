@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.12.0 (SABR proxy)
+// author: ricky | version: 2.13.0 (seekable proxy, fast chain)
 // Changes from 2.9.17 — a last-resort transport, nothing else touched:
 //   - NEW /sabr/<id>: audio streamed through YouTube's own SABR protocol
 //     (googlevideo's SabrStream, the same engine as InnerTubeX's sabr/
@@ -24,6 +24,24 @@
 //     the next segment request encode a null into the protobuf. sabr.js passes
 //     an arrow and turns an empty token into undefined. Verified end to end:
 //     a whole 3.4 MB track through the proxy in 1.5 s, no errors.
+//
+// Changes from 2.12.0 — the two complaints, both measured:
+//   - SEEKING. The proxy used to relay a live SABR session, which cannot
+//     answer a Range request and always restarted at zero — a seek paused the
+//     track forever. It now pulls the track whole (~1.5 s for 3.4 MB), caches
+//     it (isolate memory + Cache API), and serves it as a real file: correct
+//     Content-Length, 206 responses and Content-Range, working HEAD. Verified
+//     in workerd: bytes=3000000-3000999 returned 206 with
+//     "bytes 3000000-3000999/3449447".
+//   - TRACKS THAT NEVER STARTED. The chain could spend 30-40 s walking eleven
+//     identities at up to 2.5 s of probe each, long after the player gave up,
+//     and then hand out a proxy URL that could not open a session, leaving the
+//     player retrying forever. It now has a 4 s budget, and a proxy URL is
+//     only returned once the track has actually been pulled and cached.
+//   - PO tokens: the token is minted against a visitor identity, and sending
+//     it with a different visitor is an invalid pair — YouTube answers as if
+//     no token was sent. The addon now adopts the generator's visitor while
+//     its token is live, and sends the generator's API key when configured.
 // Changes from 2.9.16 — playback path untouched, chain behaviour only:
 //   - ADOPTED from InnerTubeX (MetrolistGroup/innertubex), whose
 //     ClientHealthMonitor records failures per client identity and stops
@@ -166,7 +184,7 @@
 //   - handleSearch: backfill only for empty categories, keeps all 6 search types
 //   - 8SPINE module support (async-free module code)
 
-import { openSabrAudio, sabrResponse, SABR_CLIENTS } from './sabr.js';
+import { materializeSabrTrack, parseByteRange, serveAudioBytes, SABR_CLIENTS } from './sabr.js';
 
 const LOG_PREFIX = '[YTMusic]';
 const YTM_BASE = 'https://music.youtube.com';
@@ -254,7 +272,12 @@ async function tryRefreshPoToken(env) {
     // visitor_data) already match what this function reads below.
     const res = await fetch(generatorUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        // A generator exposed on the open internet is keyed; one on localhost
+        // needs no header, so this is only sent when configured.
+        ...(env?.YT_PO_TOKEN_GENERATOR_TOKEN ? { 'x-api-key': env.YT_PO_TOKEN_GENERATOR_TOKEN } : {}),
+      },
       body: JSON.stringify({}),
       cf: { cacheTtl: 0 },
     });
@@ -310,6 +333,15 @@ async function upstashCmd(env, ...args) {
 }
 
 async function getVisitorData(env, userToken) {
+  // A PO token is minted against one specific visitor identity. Sending that
+  // token with a different visitor is not"a bit weaker" — it is an invalid
+  // pair, and YouTube answers exactly like no token was sent at all. So while
+  // a token from the generator is live, its visitor wins.
+  const poToken = await getPoToken(env);
+  if (poToken) {
+    const poVisitor = await getPoVisitorData(env);
+    if (poVisitor && poVisitor.length > 4) return poVisitor;
+  }
   const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
   const cached = await upstashCmd(env, 'GET', key);
   if (cached && typeof cached === 'string' && cached.length > 4) return cached;
@@ -1347,8 +1379,16 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo, origin = ''
     ? fetchVideoInfo(trackId, env, userToken).catch(() => null)
     : null;
 
+  const resolveStartedAt = Date.now();
   for (let i = 0; i < resolvers.length; i++) {
     const resolver = resolvers[i];
+    // Eclipse wants an answer in seconds. Walking eleven identities at up to
+    // 2.5 s of probe each is what left tracks sitting on "preparing track"
+    // forever, so the chain gives up its turn and lets the proxy answer.
+    if (Date.now() - resolveStartedAt > RESOLVE_BUDGET_MS) {
+      console.log(LOG_PREFIX, `resolve budget spent for ${trackId} — falling through`);
+      break;
+    }
     // Skip an identity that was just refused, unless it is the last hope left.
     if (clientCoolingDown(resolver.name) && resolvers.some((r) => !clientCoolingDown(r.name))) {
       console.log(LOG_PREFIX, `${resolver.name} cooling down for ${trackId}`);
@@ -1390,18 +1430,23 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo, origin = ''
       console.log(LOG_PREFIX, `${resolver.name} failed for ${trackId}: ${e.message}`);
     }
   }
-  // Last resort: our own SABR proxy. No probe here on purpose — probing the
-  // proxy would open a session and immediately throw it away, and the point of
-  // this path is that it is the transport that survives when URLs do not.
+  // Last resort: our own SABR proxy. The track is pulled and cached here, so
+  // the URL handed out answers its first request immediately — and only gets a
+  // URL if the pull actually succeeded, which is what stops the player from
+  // spinning on a proxy that would 503 it.
   if (origin) {
-    console.log(LOG_PREFIX, `every client failed for ${trackId} — handing out the SABR proxy`);
-    return {
-      url: `${origin}/sabr/${trackId}`,
-      format: 'm4a',
-      quality: 'sabr',
-      proxied: true,
-      expiresAt: Math.floor(Date.now() / 1000) + 6 * 3600,
-    };
+    console.log(LOG_PREFIX, `every client failed for ${trackId} — warming the SABR proxy`);
+    const entry = await sabrMaterialize(trackId, env, userToken);
+    if (entry) {
+      return {
+        url: `${origin}/sabr/${trackId}`,
+        format: 'm4a',
+        quality: 'sabr',
+        proxied: true,
+        expiresAt: Math.floor(Date.now() / 1000) + 6 * 3600,
+      };
+    }
+    console.log(LOG_PREFIX, `SABR proxy could not pull ${trackId} either`);
   }
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
 }
@@ -1414,6 +1459,8 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo, origin = ''
 // (a skip landing on a track the app is already prefetching) share one call.
 // Nothing is written to disk or to Redis: this dies with the isolate.
 const RESOLVE_TTL_MS = 6 * 60 * 1000;
+// How long the client chain may spend before the SABR proxy answers instead.
+const RESOLVE_BUDGET_MS = 4000;
 const MAX_MEMO = 200;
 const resolveMemo = new Map();     // trackId -> { at, result }
 const resolveInflight = new Map(); // trackId -> Promise
@@ -1517,34 +1564,90 @@ async function proxyDownload(trackId, incomingRequest, env, userToken) {
 }
 
 // ── SABR proxy (see sabr.js) ──────────────────────────────────────────────────
-// Serves the track as a plain audio stream. Only reached for tracks whose
-// direct URLs all failed — either every identity was refused, or every link it
-// produced was gated past the first megabyte.
-async function handleSabr(trackId, env, userToken) {
+// The track is pulled whole over SABR, cached, and served as a real file. A
+// relayed live session cannot answer Range requests (it always restarts at
+// zero), which is exactly what made seeking pause the track forever.
+const SABR_MEM_MAX = 6;
+const SABR_MEM_TTL_MS = 30 * 60 * 1000;
+const SABR_CACHE_TTL_SEC = 6 * 3600;
+const sabrMemory = new Map(); // trackId -> { at, bytes, contentType }
+
+function sabrCacheUrl(trackId) {
+  return `https://sabr-cache.internal/${trackId}`;
+}
+
+async function sabrCacheGet(trackId) {
+  const hit = sabrMemory.get(trackId);
+  if (hit && Date.now() - hit.at < SABR_MEM_TTL_MS) return hit;
+  sabrMemory.delete(trackId);
+  try {
+    const cached = await caches.default.match(sabrCacheUrl(trackId));
+    if (!cached) return null;
+    const bytes = new Uint8Array(await cached.arrayBuffer());
+    if (!bytes.byteLength) return null;
+    const entry = { at: Date.now(), bytes, contentType: cached.headers.get('content-type') || 'audio/mp4' };
+    sabrMemory.set(trackId, entry);
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+async function sabrCachePut(trackId, entry) {
+  if (sabrMemory.size >= SABR_MEM_MAX) sabrMemory.delete(sabrMemory.keys().next().value);
+  sabrMemory.set(trackId, entry);
+  try {
+    await caches.default.put(
+      sabrCacheUrl(trackId),
+      new Response(entry.bytes, {
+        headers: { 'content-type': entry.contentType, 'cache-control': `public, max-age=${SABR_CACHE_TTL_SEC}` },
+      }),
+    );
+  } catch (e) {
+    console.log(LOG_PREFIX, `SABR: cache write failed for ${trackId}: ${e.message}`);
+  }
+}
+
+/** Pull a track over SABR once and cache it. Returns null if no identity can. */
+async function sabrMaterialize(trackId, env, userToken) {
+  const cached = await sabrCacheGet(trackId);
+  if (cached) return cached;
   const attempts = [
     { name: 'AndroidVR', fetchPlayer: () => fetchPlayerDataAndroidVR(trackId, env, userToken), clientInfo: SABR_CLIENTS.androidVR },
     { name: 'iOS', fetchPlayer: () => fetchPlayerData(trackId, env, userToken), clientInfo: SABR_CLIENTS.ios },
   ];
   for (const attempt of attempts) {
+    const startedAt = Date.now();
     try {
       const data = await attempt.fetchPlayer();
-      const opened = openSabrAudio({
+      const track = await materializeSabrTrack({
         data,
         videoId: trackId,
         clientInfo: attempt.clientInfo,
-        mintPoToken: () => mintPoTokenBytes(env),
+        // A generator that is not configured must not be called at all.
+        mintPoToken: env?.YT_PO_TOKEN_GENERATOR_URL ? () => mintPoTokenBytes(env) : undefined,
       });
-      if (!opened) {
-        console.log(LOG_PREFIX, `SABR: ${attempt.name} reply carries no SABR session for ${trackId}`);
-        continue;
-      }
-      console.log(LOG_PREFIX, `SABR: ${attempt.name} streaming ${trackId} itag=${opened.itag}`);
-      return sabrResponse(opened);
+      const entry = { at: Date.now(), bytes: track.bytes, contentType: track.contentType };
+      await sabrCachePut(trackId, entry);
+      console.log(LOG_PREFIX, `SABR: ${attempt.name} materialized ${trackId} ${track.bytes.byteLength}B in ${Date.now() - startedAt}ms`);
+      return entry;
     } catch (e) {
-      console.log(LOG_PREFIX, `SABR: ${attempt.name} failed for ${trackId}: ${e.message}`);
+      console.log(LOG_PREFIX, `SABR: ${attempt.name} failed for ${trackId} after ${Date.now() - startedAt}ms: ${e.message}`);
     }
   }
   return null;
+}
+
+async function handleSabr(trackId, request, env, userToken) {
+  const entry = await sabrMaterialize(trackId, env, userToken);
+  if (!entry) return null;
+  const range = parseByteRange(request.headers.get('range'), entry.bytes.byteLength);
+  return serveAudioBytes({
+    bytes: entry.bytes,
+    contentType: entry.contentType,
+    range,
+    head: request.method === 'HEAD',
+  });
 }
 
 function extractSecondaryTracks(data, fallbackArtist, fallbackAlbum, fallbackArtwork) {
@@ -1702,7 +1805,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.12.0', description: v.description,
+    id: v.id, name: v.name, version: '2.13.0', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
@@ -1968,7 +2071,7 @@ if (ECLIPSE_GATED_PREFIXES.some((p) => rest === p || rest.startsWith(p + "/"))) 
   if (rest.startsWith('/sabr/')) {
     const id = lastSegment(rest);
     if (!id) return jsonRes({ error: 'Missing ID' }, 400);
-    const streamed = await handleSabr(id, env, userToken);
+    const streamed = await handleSabr(id, request, env, userToken);
     if (streamed) return streamed;
     return new Response(JSON.stringify({ error: 'Not ready' }), {
       status: 503,
