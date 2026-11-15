@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.13.0 (seekable proxy, fast chain)
+// author: ricky | version: 2.13.1 (seekable proxy, fast chain, cookie everywhere)
 // Changes from 2.9.17 — a last-resort transport, nothing else touched:
 //   - NEW /sabr/<id>: audio streamed through YouTube's own SABR protocol
 //     (googlevideo's SabrStream, the same engine as InnerTubeX's sabr/
@@ -42,6 +42,9 @@
 //     it with a different visitor is an invalid pair — YouTube answers as if
 //     no token was sent. The addon now adopts the generator's visitor while
 //     its token is live, and sends the generator's API key when configured.
+//   - COOKIE REACH. YT_COOKIE used to reach three of eleven player identities.
+//     It is now attached to every player, search and browse call, because on a
+//     datacenter IP the identities without it are the ones that fail.
 // Changes from 2.9.16 — playback path untouched, chain behaviour only:
 //   - ADOPTED from InnerTubeX (MetrolistGroup/innertubex), whose
 //     ClientHealthMonitor records failures per client identity and stops
@@ -245,6 +248,19 @@ const SEARCH_HEADERS = {
 const ANDROID_MUSIC_UA = 'com.google.android.apps.youtube.music/7.27.0 (Linux; U; Android 14; en_US) gzip';
 const IOS_UA = 'com.google.ios.youtube/20.12.4 (iPhone17,3; U; CPU iOS 18_4_1 like Mac OS X)';
 
+// A signed-in session is the only thing measured to clear YouTube's "confirm
+// you're not a bot" verdict from a datacenter IP. Measured from this Worker's
+// own egress: eleven client identities x ten popular songs, anon and with a
+// valid PO token, returned zero playable results — every answer was
+// LOGIN_REQUIRED or UNPLAYABLE. A cookie that only reaches three of the eleven
+// identities leaves the other eight just as gated, so it goes on all of them.
+function playerHeaders(extra, env) {
+  const headers = { 'Content-Type': 'application/json', ...extra };
+  const cookie = env?.YT_COOKIE;
+  if (cookie) headers['Cookie'] = cookie;
+  return headers;
+}
+
 async function getPoToken(env) {
   const cached = await upstashCmd(env, 'GET', 'ytm:po_token');
   if (cached && typeof cached === 'string' && cached.length > 4) return cached;
@@ -445,7 +461,7 @@ async function ytmBrowse(browseId, env, userToken) {
     console.log(LOG_PREFIX, `ytmBrowse WEB_REMIX failed (${e.message}), retrying with ANDROID_MUSIC`);
     const resp = await fetch(`${YTM_BASE}/youtubei/v1/browse?key=${getApiKey(env)}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_MUSIC_UA },
+      headers: playerHeaders({ 'User-Agent': ANDROID_MUSIC_UA }, env),
       body: JSON.stringify({ context: { client: ANDROID_MUSIC_CLIENT }, browseId }),
     });
     if (!resp.ok) throw new Error(`${LOG_PREFIX} HTTP ${resp.status} on browse (both clients failed)`);
@@ -462,7 +478,7 @@ async function ytmSearchAndroid(query, params, env) {
   if (params) body.params = params;
   const resp = await fetch(`${YTM_BASE}/youtubei/v1/search?key=${getApiKey(env)}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_MUSIC_UA },
+    headers: playerHeaders({ 'User-Agent': ANDROID_MUSIC_UA }, env),
     body: JSON.stringify(body),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} Android search HTTP ${resp.status}`);
@@ -838,7 +854,7 @@ async function fetchPlayerData(trackId, env, userToken) {
   const baseBody = { context: { client: buildIosContext(visitorData) }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': IOS_UA },
+    headers: playerHeaders({ 'User-Agent': IOS_UA }, env),
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} Player HTTP ${resp.status}`);
@@ -913,11 +929,11 @@ async function fetchPlayerDataMWeb(trackId, env, userToken) {
   const baseBody = { context: { client: { ...MWEB_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json', 'User-Agent': MWEB_UA,
+    headers: playerHeaders({
+      'User-Agent': MWEB_UA,
       'Origin': 'https://m.youtube.com', 'Referer': 'https://m.youtube.com/',
       'X-Youtube-Client-Name': '2', 'X-Youtube-Client-Version': MWEB_CLIENT.clientVersion,
-    },
+    }, env),
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} MWEB player HTTP ${resp.status}`);
@@ -931,11 +947,10 @@ async function fetchPlayerDataWebCreator(trackId, env, userToken) {
   const baseBody = { context: { client: { ...WEB_CREATOR_CLIENT, visitorData }, thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+    headers: playerHeaders({
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
       'Origin': 'https://www.youtube.com', 'Referer': `https://www.youtube.com/embed/${trackId}`,
-    },
+    }, env),
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} WebCreator player HTTP ${resp.status}`);
@@ -949,7 +964,7 @@ async function fetchPlayerDataAndroidNative(trackId, env, userToken) {
   const baseBody = { context: { client: { ...ANDROID_NATIVE_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_NATIVE_UA, 'X-Goog-Api-Format-Version': '2' },
+    headers: playerHeaders({ 'User-Agent': ANDROID_NATIVE_UA, 'X-Goog-Api-Format-Version': '2' }, env),
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} AndroidNative player HTTP ${resp.status}`);
@@ -962,11 +977,10 @@ async function fetchPlayerDataWebEmbedded(trackId, env, userToken) {
   const baseBody = { context: { client: { ...WEB_EMBEDDED_CLIENT, visitorData }, thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+    headers: playerHeaders({
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
       'Origin': 'https://www.youtube.com', 'Referer': `https://www.youtube.com/embed/${trackId}`,
-    },
+    }, env),
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} WebEmbedded player HTTP ${resp.status}`);
@@ -980,7 +994,7 @@ async function fetchPlayerDataAndroidVR(trackId, env, userToken) {
   const baseBody = { context: { client: { ...ANDROID_VR_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_VR_UA, 'X-Goog-Api-Format-Version': '2' },
+    headers: playerHeaders({ 'User-Agent': ANDROID_VR_UA, 'X-Goog-Api-Format-Version': '2' }, env),
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} AndroidVR player HTTP ${resp.status}`);
@@ -1805,7 +1819,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.13.0', description: v.description,
+    id: v.id, name: v.name, version: '2.13.1', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
