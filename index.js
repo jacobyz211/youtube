@@ -1,105 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.13.2 (seekable proxy, racing chain, cookie everywhere)
-// Changes from 2.9.17 — a last-resort transport, nothing else touched:
-//   - NEW /sabr/<id>: audio streamed through YouTube's own SABR protocol
-//     (googlevideo's SabrStream, the same engine as InnerTubeX's sabr/
-//     package). This is the one transport that does not hand out a
-//     googlevideo URL — the thing that expires, is bound to the identity that
-//     asked, and answers 206 then 403 once that identity is flagged.
-//     Measured on a datacenter IP, same track, same minute: direct URL 403,
-//     SABR 200/200/200 and ~500 KB in 1.4 s.
-//   - /stream uses it only after every client in the chain has failed, and
-//     returns the proxy as `{ url: <origin>/sabr/<id>, quality: 'sabr' }`, so
-//     the reply shape Eclipse consumes is unchanged.
-//   - The proxy is never probed (a probe would open and throw away a session),
-//     it answers `accept-ranges: none` because a SABR session has no byte
-//     offsets to satisfy Range with, and it 503s with Retry-After if no
-//     identity can open one.
-//   - PO tokens come from the existing YT_PO_TOKEN_GENERATOR_URL when present;
-//     without a generator SABR still serves everything that does not need one.
-//   - Two Worker-runtime faults were found by streaming a real track through
-//     `wrangler dev` (Node never showed either): googlevideo calls the fetch it
-//     is handed as `this.fetchFunction(...)`, which workerd rejects as an
-//     illegal invocation, and a PO-token callback that resolves to null made
-//     the next segment request encode a null into the protobuf. sabr.js passes
-//     an arrow and turns an empty token into undefined. Verified end to end:
-//     a whole 3.4 MB track through the proxy in 1.5 s, no errors.
-//
-// Changes from 2.12.0 — the two complaints, both measured:
-//   - SEEKING. The proxy used to relay a live SABR session, which cannot
-//     answer a Range request and always restarted at zero — a seek paused the
-//     track forever. It now pulls the track whole (~1.5 s for 3.4 MB), caches
-//     it (isolate memory + Cache API), and serves it as a real file: correct
-//     Content-Length, 206 responses and Content-Range, working HEAD. Verified
-//     in workerd: bytes=3000000-3000999 returned 206 with
-//     "bytes 3000000-3000999/3449447".
-//   - TRACKS THAT NEVER STARTED. The chain could spend 30-40 s walking eleven
-//     identities at up to 2.5 s of probe each, long after the player gave up,
-//     and then hand out a proxy URL that could not open a session, leaving the
-//     player retrying forever. It now has a 4 s budget, and a proxy URL is
-//     only returned once the track has actually been pulled and cached.
-//   - PO tokens: the token is minted against a visitor identity, and sending
-//     it with a different visitor is an invalid pair — YouTube answers as if
-//     no token was sent. The addon now adopts the generator's visitor while
-//     its token is live, and sends the generator's API key when configured.
-//   - THE CHAIN RACES. Eleven identities walked one after another was ten
-//     seconds of "preparing track" on a track YouTube refuses anyway; they now
-//     start staggered and the first answer wins (budget 2.5 s), and a track
-//     that was just refused is not re-walked for a minute.
-//   - COOKIE REACH. YT_COOKIE used to reach three of eleven player identities.
-//     It is now attached to every player, search and browse call, because on a
-//     datacenter IP the identities without it are the ones that fail.
-// Changes from 2.9.16 — playback path untouched, chain behaviour only:
-//   - ADOPTED from InnerTubeX (MetrolistGroup/innertubex), whose
-//     ClientHealthMonitor records failures per client identity and stops
-//     asking one that was just refused. A client that answered "Sign in to
-//     confirm you're not a bot" answered it for the next several requests, so
-//     the old chain paid a failed round trip on almost every track and kept
-//     the verdict warm. Failures are now counted per client: a bot verdict
-//     parks that identity for five minutes, two ordinary failures park it for
-//     ninety seconds, and a success clears it.
-//   - The sticky preferred client only leads while it is healthy; a cooling
-//     client goes back into the chain instead of the head of the queue.
-//   - The skip is advisory: if every identity is cooling down the chain runs
-//     anyway, so a bad minute can never make a track unplayable.
-// Changes from 2.9.15 — 2.9.15 stopped playback, so it is reverted in full:
-//   - resolveIOS hands out the HLS manifest first again, exactly like "YouTube
-//     Music Direct" (its PLAYBACK_ORDER leads with ios-hls). Preferring the
-//     adaptive audio file sent every iOS reply down the gated path instead.
-//   - the verification probe is back to the plain read past 1 MiB. Sizing it
-//     from the URL's own clen parameter rejected links that do play fine.
-//   - /stream replies are back to their 2.9.14 shape: no codec/container/
-//     manifest keys. They are optional in the docs, and adding them was the one
-//     thing that changed on EVERY reply when playback broke.
-//   - the Direct fallback ranks sources in the module's own order:
-//     ios-hls, android-progressive, android-audio, ios-audio, android-hls.
-// Changes from 2.9.13:
-//   - ADOPTED from the working "YouTube Music Direct" module (nvmindl, v5.3):
-//     a link is now VERIFIED before it is handed out. A PO-token-gated
-//     googlevideo URL answers 206 for its first megabyte and 403 after it, so
-//     a probe at byte 0 passes on links that die a minute into the song. The
-//     probe starts past 1 MiB; a gated verdict costs one attempt and the chain
-//     moves on, while 'unknown' (timeout) is accepted.
-//   - NEW last resort resolver Direct, also from that module: it asks iOS and
-//     Android together, ranks every source they carry (muxed MP4 first,
-//     adaptive audio, then HLS) and probes them in rank order, then repeats
-//     once with a fresh visitor because bot verdicts are per-visitor.
-// Changes from 2.9.12:
-//   - /stream no longer stalls the queue. Three separate causes, all removed:
-//       * the optional `video` lookup was awaited on the success path, adding
-//         up to three player calls to every reply. It now runs alongside the
-//         audio chain and is capped at 250 ms after audio resolves;
-//       * every reply is a fresh resolve, so swiping spent one call (or ten)
-//         per track and YouTube answered the burst with bot checks. Finished
-//         resolves are now reused for six minutes from RAM only, and a second
-//         request for the same track joins the one already running;
-//       * the chain always started at VisionOS. The client that worked last
-//         is now tried first, so a queue pays no failed-attempt sleeps;
-//   - A failing /stream now answers 503 + Retry-After: 1 instead of 500, which
-//     is what Eclipse retries. A 500 is treated as fatal and leaves the
-//     player spinning on that track forever.
-//   - Progressive audio is picked before an HLS manifest, so playback starts
-//     on the first byte rather than after a playlist is parsed.
+// author: ricky | version: 2.9.11 (real PO token generator support)
 // Changes from 2.9.10:
 //   - FIX: tryRefreshPoToken() sent a bare GET to YT_PO_TOKEN_GENERATOR_URL.
 //     Real BotGuard-attestation PO token generators — e.g. bgutil-ytdlp-pot-
@@ -191,8 +91,6 @@
 //   - handleSearch: backfill only for empty categories, keeps all 6 search types
 //   - 8SPINE module support (async-free module code)
 
-import { materializeSabrTrack, parseByteRange, serveAudioBytes, SABR_CLIENTS } from './sabr.js';
-
 const LOG_PREFIX = '[YTMusic]';
 const YTM_BASE = 'https://music.youtube.com';
 const YTM_API_KEY_FALLBACK = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -227,12 +125,6 @@ const WEB_EMBEDDED_CLIENT = { clientName: 'WEB_EMBEDDED_PLAYER', clientVersion: 
 const TVHTML5_CLIENT = { clientName: 'TVHTML5', clientVersion: '7.20260815.16.00', hl: 'en', gl: 'US' };
 const TVHTML5_UA = 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.5) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/2.2 TV Safari/537.36';
 const TV_EMBEDDED_CLIENT = { clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0', hl: 'en', gl: 'US' };
-// NEW (2.9.12): VISIONOS — the visionOS app identity. It answers with plain
-// progressive URLs (no ciphered signature) and consumes no PO token, so it is
-// tried before every client that needs either.
-const VISIONOS_CLIENT = { clientName: 'VISIONOS', clientVersion: '1.02', deviceMake: 'Apple', deviceModel: 'RealityDevice17,1', osName: 'visionOS', osVersion: '26.5.23O471', hl: 'en', gl: 'US' };
-const VISIONOS_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15';
-const VISIONOS_CLIENT_ID = '101';
 
 const SEARCH_PARAMS = {
   songs: 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
@@ -251,19 +143,6 @@ const SEARCH_HEADERS = {
 
 const ANDROID_MUSIC_UA = 'com.google.android.apps.youtube.music/7.27.0 (Linux; U; Android 14; en_US) gzip';
 const IOS_UA = 'com.google.ios.youtube/20.12.4 (iPhone17,3; U; CPU iOS 18_4_1 like Mac OS X)';
-
-// A signed-in session is the only thing measured to clear YouTube's "confirm
-// you're not a bot" verdict from a datacenter IP. Measured from this Worker's
-// own egress: eleven client identities x ten popular songs, anon and with a
-// valid PO token, returned zero playable results — every answer was
-// LOGIN_REQUIRED or UNPLAYABLE. A cookie that only reaches three of the eleven
-// identities leaves the other eight just as gated, so it goes on all of them.
-function playerHeaders(extra, env) {
-  const headers = { 'Content-Type': 'application/json', ...extra };
-  const cookie = env?.YT_COOKIE;
-  if (cookie) headers['Cookie'] = cookie;
-  return headers;
-}
 
 async function getPoToken(env) {
   const cached = await upstashCmd(env, 'GET', 'ytm:po_token');
@@ -292,12 +171,7 @@ async function tryRefreshPoToken(env) {
     // visitor_data) already match what this function reads below.
     const res = await fetch(generatorUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        // A generator exposed on the open internet is keyed; one on localhost
-        // needs no header, so this is only sent when configured.
-        ...(env?.YT_PO_TOKEN_GENERATOR_TOKEN ? { 'x-api-key': env.YT_PO_TOKEN_GENERATOR_TOKEN } : {}),
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
       cf: { cacheTtl: 0 },
     });
@@ -314,31 +188,6 @@ async function tryRefreshPoToken(env) {
     console.log(LOG_PREFIX, 'PO token auto-refresh failed:', e.message);
   }
 }
-
-// BotGuard hands out base64url text; SABR carries the token as raw bytes in its
-// protobuf streamer context, so it has to be decoded before it is sent.
-function poTokenToBytes(token) {
-  try {
-    const normalized = String(token).replace(/-/g, '+').replace(/_/g, '/');
-    const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
-    const raw = atob(padded);
-    const bytes = new Uint8Array(raw.length);
-    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-    return bytes;
-  } catch {
-    return null;
-  }
-}
-
-// Only called when the SABR server asks for an attestation mid-stream.
-async function mintPoTokenBytes(env) {
-  let token = await getPoToken(env);
-  if (!token && env?.YT_PO_TOKEN_GENERATOR_URL) {
-    await tryRefreshPoToken(env);
-    token = await getPoToken(env);
-  }
-  return token ? poTokenToBytes(token) : null;
-}
 async function upstashCmd(env, ...args) {
   const url = env?.UPSTASH_REDIS_REST_URL, token = env?.UPSTASH_REDIS_REST_TOKEN;
   if (!url || !token) return null;
@@ -353,15 +202,6 @@ async function upstashCmd(env, ...args) {
 }
 
 async function getVisitorData(env, userToken) {
-  // A PO token is minted against one specific visitor identity. Sending that
-  // token with a different visitor is not"a bit weaker" — it is an invalid
-  // pair, and YouTube answers exactly like no token was sent at all. So while
-  // a token from the generator is live, its visitor wins.
-  const poToken = await getPoToken(env);
-  if (poToken) {
-    const poVisitor = await getPoVisitorData(env);
-    if (poVisitor && poVisitor.length > 4) return poVisitor;
-  }
   const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
   const cached = await upstashCmd(env, 'GET', key);
   if (cached && typeof cached === 'string' && cached.length > 4) return cached;
@@ -465,7 +305,7 @@ async function ytmBrowse(browseId, env, userToken) {
     console.log(LOG_PREFIX, `ytmBrowse WEB_REMIX failed (${e.message}), retrying with ANDROID_MUSIC`);
     const resp = await fetch(`${YTM_BASE}/youtubei/v1/browse?key=${getApiKey(env)}`, {
       method: 'POST',
-      headers: playerHeaders({ 'User-Agent': ANDROID_MUSIC_UA }, env),
+      headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_MUSIC_UA },
       body: JSON.stringify({ context: { client: ANDROID_MUSIC_CLIENT }, browseId }),
     });
     if (!resp.ok) throw new Error(`${LOG_PREFIX} HTTP ${resp.status} on browse (both clients failed)`);
@@ -482,7 +322,7 @@ async function ytmSearchAndroid(query, params, env) {
   if (params) body.params = params;
   const resp = await fetch(`${YTM_BASE}/youtubei/v1/search?key=${getApiKey(env)}`, {
     method: 'POST',
-    headers: playerHeaders({ 'User-Agent': ANDROID_MUSIC_UA }, env),
+    headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_MUSIC_UA },
     body: JSON.stringify(body),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} Android search HTTP ${resp.status}`);
@@ -858,7 +698,7 @@ async function fetchPlayerData(trackId, env, userToken) {
   const baseBody = { context: { client: buildIosContext(visitorData) }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: playerHeaders({ 'User-Agent': IOS_UA }, env),
+    headers: { 'Content-Type': 'application/json', 'User-Agent': IOS_UA },
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} Player HTTP ${resp.status}`);
@@ -933,11 +773,11 @@ async function fetchPlayerDataMWeb(trackId, env, userToken) {
   const baseBody = { context: { client: { ...MWEB_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: playerHeaders({
-      'User-Agent': MWEB_UA,
+    headers: {
+      'Content-Type': 'application/json', 'User-Agent': MWEB_UA,
       'Origin': 'https://m.youtube.com', 'Referer': 'https://m.youtube.com/',
       'X-Youtube-Client-Name': '2', 'X-Youtube-Client-Version': MWEB_CLIENT.clientVersion,
-    }, env),
+    },
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} MWEB player HTTP ${resp.status}`);
@@ -951,10 +791,11 @@ async function fetchPlayerDataWebCreator(trackId, env, userToken) {
   const baseBody = { context: { client: { ...WEB_CREATOR_CLIENT, visitorData }, thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: playerHeaders({
+    headers: {
+      'Content-Type': 'application/json',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
       'Origin': 'https://www.youtube.com', 'Referer': `https://www.youtube.com/embed/${trackId}`,
-    }, env),
+    },
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} WebCreator player HTTP ${resp.status}`);
@@ -968,7 +809,7 @@ async function fetchPlayerDataAndroidNative(trackId, env, userToken) {
   const baseBody = { context: { client: { ...ANDROID_NATIVE_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: playerHeaders({ 'User-Agent': ANDROID_NATIVE_UA, 'X-Goog-Api-Format-Version': '2' }, env),
+    headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_NATIVE_UA, 'X-Goog-Api-Format-Version': '2' },
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} AndroidNative player HTTP ${resp.status}`);
@@ -981,10 +822,11 @@ async function fetchPlayerDataWebEmbedded(trackId, env, userToken) {
   const baseBody = { context: { client: { ...WEB_EMBEDDED_CLIENT, visitorData }, thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: playerHeaders({
+    headers: {
+      'Content-Type': 'application/json',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
       'Origin': 'https://www.youtube.com', 'Referer': `https://www.youtube.com/embed/${trackId}`,
-    }, env),
+    },
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} WebEmbedded player HTTP ${resp.status}`);
@@ -998,35 +840,12 @@ async function fetchPlayerDataAndroidVR(trackId, env, userToken) {
   const baseBody = { context: { client: { ...ANDROID_VR_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: playerHeaders({ 'User-Agent': ANDROID_VR_UA, 'X-Goog-Api-Format-Version': '2' }, env),
+    headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_VR_UA, 'X-Goog-Api-Format-Version': '2' },
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} AndroidVR player HTTP ${resp.status}`);
   const data = await resp.json();
   if (data?.playabilityStatus?.status !== 'OK') throw new Error(`${LOG_PREFIX} AndroidVR blocked: ${data?.playabilityStatus?.reason || 'unknown'}`);
-  return data;
-}
-
-// NEW (2.9.12): VISIONOS. No cookie and no PO token are attached on purpose —
-// this identity neither needs nor benefits from them, and a token it does not
-// expect is itself a tamper signal.
-async function fetchPlayerDataVisionOS(trackId, env, userToken) {
-  const visitorData = await getVisitorData(env, userToken);
-  const baseBody = { context: { client: { ...VISIONOS_CLIENT, visitorData } }, videoId: trackId, contentCheckOk: true, racyCheckOk: true };
-  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': VISIONOS_UA,
-      'X-Youtube-Client-Name': VISIONOS_CLIENT_ID,
-      'X-Youtube-Client-Version': VISIONOS_CLIENT.clientVersion,
-      'Origin': 'https://www.youtube.com',
-    },
-    body: JSON.stringify(baseBody),
-  });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} VisionOS player HTTP ${resp.status}`);
-  const data = await resp.json();
-  if (data?.playabilityStatus?.status !== 'OK') throw new Error(`${LOG_PREFIX} VisionOS blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
   return data;
 }
 
@@ -1064,23 +883,19 @@ async function resolveAndroidMusic(trackId, env, userToken) {
 // NEW (2.9.8): TVHTML5 — different fingerprint family (TV surface).
 async function resolveTV(trackId, env, userToken) {
   const data = await fetchPlayerDataTV(trackId, env, userToken);
-  // Progressive audio first: a plain file needs no playlist parsing, and the
-  // app starts it on the first byte instead of after the manifest.
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   const hlsUrl = data?.streamingData?.hlsManifestUrl;
   if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
 }
 // NEW (2.9.8): TVHTML5_SIMPLY_EMBEDDED_PLAYER — TV-embed variant.
 async function resolveTVEmbedded(trackId, env, userToken) {
   const data = await fetchPlayerDataTVEmbedded(trackId, env, userToken);
-  // Progressive audio first: a plain file needs no playlist parsing, and the
-  // app starts it on the first byte instead of after the manifest.
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   const hlsUrl = data?.streamingData?.hlsManifestUrl;
   if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
 }
 // ── Video support (ADDITIVE ONLY — eclipsemusic.app/docs "Video Playback") ──
@@ -1149,32 +964,26 @@ async function resolveIOS(trackId, env, userToken) {
 }
 async function resolveMWeb(trackId, env, userToken) {
   const data = await fetchPlayerDataMWeb(trackId, env, userToken);
-  // Progressive audio first: a plain file needs no playlist parsing, and the
-  // app starts it on the first byte instead of after the manifest.
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   const hlsUrl = data?.streamingData?.hlsManifestUrl;
   if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
 }
 async function resolveWebCreator(trackId, env, userToken) {
   const data = await fetchPlayerDataWebCreator(trackId, env, userToken);
-  // Progressive audio first: a plain file needs no playlist parsing, and the
-  // app starts it on the first byte instead of after the manifest.
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   const hlsUrl = data?.streamingData?.hlsManifestUrl;
   if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
 }
 async function resolveWebEmbedded(trackId, env, userToken) {
   const data = await fetchPlayerDataWebEmbedded(trackId, env, userToken);
-  // Progressive audio first: a plain file needs no playlist parsing, and the
-  // app starts it on the first byte instead of after the manifest.
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   const hlsUrl = data?.streamingData?.hlsManifestUrl;
   if (hlsUrl) return { url: hlsUrl, format: 'hls', quality: 'auto' };
+  const best = pickBestAudio(data?.streamingData);
+  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
 }
 async function resolveAndroidVR(trackId, env, userToken) {
@@ -1183,176 +992,12 @@ async function resolveAndroidVR(trackId, env, userToken) {
   if (best) return { url: best.url, format: 'm4a', quality: 'native' };
   throw new Error('no usable format');
 }
-// NEW (2.9.12): VISIONOS resolves the licensed "- Topic" art tracks that every
-// other identity answers UNPLAYABLE, so it leads the chain.
-async function resolveVisionOS(trackId, env, userToken) {
-  const data = await fetchPlayerDataVisionOS(trackId, env, userToken);
-  const best = pickBestAudio(data?.streamingData);
-  if (best) return { url: best.url, format: 'm4a', quality: 'native' };
-  throw new Error('no usable format');
-}
-// ── NEW (2.9.14): DIRECT FALLBACK, ported from "YouTube Music Direct" ─────────
-// The working Eclipse module (nvmindl, v5.3) resolves from the phone instead of
-// from a Worker, but two of its ideas carry over exactly and the chain above
-// does neither:
-//   1. ask iOS and Android TOGETHER and keep both answers, then rank every
-//      source they carry instead of settling for whichever client replied
-//      first. Muxed MP4 leads (the format YouTube gates least), adaptive audio
-//      next, HLS last;
-//   2. verify the winner before handing it out. A PO-token-gated googlevideo
-//      link serves the first megabyte happily and only then answers 403, so a
-//      probe at byte 0 passes on links that die a minute into the song. The
-//      probe therefore starts past 1 MiB.
-// This is a LAST resort: it only runs once every cheaper identity has failed,
-// and it repeats once with a fresh visitor, since bot verdicts are per-visitor.
-const GATED_PREVIEW_BYTES = 1024 * 1024;
-const DIRECT_PROBE_TIMEOUT_MS = 2500;
-
-function directProbeOffset(size) {
-  const pastGate = GATED_PREVIEW_BYTES + 64 * 1024;
-  if (!size) return pastGate;
-  if (size > pastGate + 64 * 1024) return Math.max(pastGate, Math.floor(size * 0.6));
-  return Math.max(0, size - 2);
-}
-function directSize(format) {
-  const exact = Number(format.contentLength);
-  if (exact > 0) return exact;
-  const bitrate = Number(format.averageBitrate || format.bitrate) || 0;
-  const durationMs = Number(format.approxDurationMs) || 0;
-  return Math.floor(bitrate * durationMs / 8000);
-}
-function directStatusClass(status) {
-  if (status === 200 || status === 206) return 'ok';
-  if (status === 401 || status === 403 || status === 404 || status === 410) return 'bad';
-  return 'unknown';
-}
-async function directFetch(url, headers) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), DIRECT_PROBE_TIMEOUT_MS);
-  try {
-    const resp = await fetch(url, { headers, signal: controller.signal });
-    const total = Number((resp.headers.get('content-range') || '').match(/\/(\d+)$/)?.[1]) || 0;
-    return { status: resp.status, total, resp };
-  } catch {
-    return { status: 0, total: 0, resp: null };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-async function directProbe(url, offset) {
-  const out = await directFetch(url, { Range: `bytes=${offset}-${offset + 1}` });
-  try { await out.resp?.body?.cancel(); } catch {}
-  return out;
-}
-// 'ok' = playable, 'bad' = YouTube refused it, 'unknown' = could not tell.
-async function directCheckFile(media) {
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    let probed = await directProbe(media.url, directProbeOffset(media.size));
-    // The size estimate overshot the file; probe again inside its real length.
-    if (probed.status === 416 && probed.total) {
-      probed = await directProbe(media.url, directProbeOffset(probed.total));
-    }
-    const verdict = directStatusClass(probed.status);
-    if (verdict !== 'unknown') return verdict;
-    if (attempt === 1) await new Promise(r => setTimeout(r, 200));
-  }
-  return 'unknown';
-}
-async function directPlaylist(url) {
-  const out = await directFetch(url, {});
-  const text = out.resp?.ok ? (await out.resp.text().catch(() => '')).trim() : '';
-  return { status: out.status, text };
-}
-async function directCheckHls(media) {
-  const master = await directPlaylist(media.url);
-  if (directStatusClass(master.status) !== 'ok') return directStatusClass(master.status);
-  if (!master.text.startsWith('#EXTM3U')) return 'bad';
-  if (master.text.includes('#EXTINF')) return 'ok';
-  const variantUrl = master.text.split('\n').map(l => l.trim()).find(l => /^https?:\/\//.test(l));
-  if (!variantUrl) return 'bad';
-  const variant = await directPlaylist(variantUrl);
-  if (directStatusClass(variant.status) !== 'ok') return directStatusClass(variant.status);
-  return variant.text.includes('#EXTINF') ? 'ok' : 'bad';
-}
-function directCheck(media) {
-  return media.isHls ? directCheckHls(media) : directCheckFile(media);
-}
-// Ranked exactly as the module ranks them (PLAYBACK_ORDER): iOS HLS answers
-// fastest, Android muxed MP4 is the format YouTube gates least, adaptive audio
-// is often gated, and the remaining HLS playlist comes last.
-function directCandidates(ios, android) {
-  const list = [];
-  const iosHls = ios?.streamingData?.hlsManifestUrl;
-  if (iosHls) list.push({ source: 'ios-hls', url: iosHls, format: 'hls', size: 0, isHls: true });
-  const progressive = pickProgressiveFormat(android?.streamingData);
-  if (progressive?.url) list.push({ source: 'android-progressive', url: progressive.url, format: 'mp4', size: directSize(progressive), isHls: false });
-  const androidAudio = pickBestAudio(android?.streamingData);
-  if (androidAudio?.url) list.push({ source: 'android-audio', url: androidAudio.url, format: 'm4a', size: directSize(androidAudio), isHls: false });
-  const iosAudio = pickBestAudio(ios?.streamingData);
-  if (iosAudio?.url) list.push({ source: 'ios-audio', url: iosAudio.url, format: 'm4a', size: directSize(iosAudio), isHls: false });
-  const androidHls = android?.streamingData?.hlsManifestUrl;
-  if (androidHls) list.push({ source: 'android-hls', url: androidHls, format: 'hls', size: 0, isHls: true });
-  return list;
-}
-async function resolveDirectFallback(trackId, env, userToken) {
-  let unverified = null;
-  for (let round = 1; round <= 2; round++) {
-    if (round > 1) {
-      await upstashCmd(env, 'DEL', userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor');
-      await new Promise(r => setTimeout(r, 250));
-    }
-    const [ios, android] = await Promise.all([
-      fetchPlayerData(trackId, env, userToken).catch((e) => { console.log(LOG_PREFIX, `Direct: ios player failed for ${trackId}:`, e.message); return null; }),
-      fetchPlayerDataAndroid(trackId, env, userToken).catch((e) => { console.log(LOG_PREFIX, `Direct: android player failed for ${trackId}:`, e.message); return null; }),
-    ]);
-    const candidates = directCandidates(ios, android);
-    if (!candidates.length) {
-      console.log(LOG_PREFIX, `Direct: no candidates for ${trackId} (round ${round})`);
-      continue;
-    }
-    // Probe everything at once, but settle in rank order, so a slow low-ranked
-    // probe never holds up a verified better one.
-    const verdicts = candidates.map(directCheck);
-    for (let i = 0; i < candidates.length; i++) {
-      const verdict = await verdicts[i];
-      if (verdict === 'ok') {
-        console.log(LOG_PREFIX, `Direct: using ${candidates[i].source} for ${trackId} (probe ok)`);
-        return { url: candidates[i].url, format: candidates[i].format, quality: 'native' };
-      }
-      console.log(LOG_PREFIX, `Direct: ${candidates[i].source} for ${trackId} probe=${verdict}`);
-      if (verdict === 'unknown' && !unverified) unverified = candidates[i];
-    }
-  }
-  // The network was too unreliable to verify anything; an unverified URL beats none.
-  if (unverified) {
-    console.log(LOG_PREFIX, `Direct: using unverified ${unverified.source} for ${trackId}`);
-    return { url: unverified.url, format: unverified.format, quality: 'native' };
-  }
-  throw new Error('direct fallback found no source');
-}
 // ── FIX: Sequential stream resolution instead of parallel ──────────────
 // Previously: Promise.allSettled fired all 6 resolvers at once, YouTube saw
 // 6 simultaneous player API calls from the same IP and blocked them all as
 // "Sign in to confirm you're not a bot". Now: try one at a time, return on
 // first success. Best case = 1 API call, worst case = 6 (but sequential).
-async function handleStream(trackId, env, userToken, wantVideo = false, origin = '') {
-  const memo = memoGet(trackId);
-  if (memo) return memo;
-  const already = resolveInflight.get(trackId);
-  if (already) return already;
-
-  const task = resolveStreamOnce(trackId, env, userToken, wantVideo, origin);
-  resolveInflight.set(trackId, task);
-  try {
-    const result = await task;
-    memoPut(trackId, result);
-    return result;
-  } finally {
-    resolveInflight.delete(trackId);
-  }
-}
-
-async function resolveStreamOnce(trackId, env, userToken, wantVideo, origin = '') {
+async function handleStream(trackId, env, userToken) {
   // Always try all 9 clients (2.9.10 reverted a PO-gated skip after
   // production logs showed AndroidNative resolving fine with zero bot
   // errors even without a PO token — see changelog above).
@@ -1361,16 +1006,11 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo, origin = ''
   // URL is configured and nothing is cached — this only affects what gets
   // attached to each request via withPoToken(), never which/how many
   // clients get tried.
-  const refusedUntil = gatedMemo.get(trackId);
-  if (refusedUntil && refusedUntil > Date.now()) {
-    throw new Error(`${LOG_PREFIX} ${trackId} was refused by every client ${Math.round((Date.now() - (refusedUntil - GATED_MEMO_MS)) / 1000)}s ago — not retrying yet`);
-  }
   if (!(await getPoToken(env)) && env?.YT_PO_TOKEN_GENERATOR_URL) {
     await tryRefreshPoToken(env);
   }
 
   const resolvers = [
-    { name: 'VisionOS', run: () => resolveVisionOS(trackId, env, userToken) },
     { name: 'AndroidNative', run: () => resolveAndroidNative(trackId, env, userToken) },
     { name: 'AndroidMusic', run: () => resolveAndroidMusic(trackId, env, userToken) },
     { name: 'iOS', run: () => resolveIOS(trackId, env, userToken) },
@@ -1380,208 +1020,36 @@ async function resolveStreamOnce(trackId, env, userToken, wantVideo, origin = ''
     { name: 'TV', run: () => resolveTV(trackId, env, userToken) },
     { name: 'TVEmbedded', run: () => resolveTVEmbedded(trackId, env, userToken) },
     { name: 'AndroidVR', run: () => resolveAndroidVR(trackId, env, userToken) },
-    // Ported last resort — see the DIRECT FALLBACK block above.
-    { name: 'Direct', run: () => resolveDirectFallback(trackId, env, userToken) },
   ];
-  // Sticky ordering: whatever client resolved the previous track is tried
-  // first. On a queue it removes the failed-attempt sleep from almost every
-  // song, and it stops re-walking a chain whose leading clients are being
-  // bot-checked right now.
-  // A client that is currently cooling down does not get the head of the
-  // queue: the identity that worked last stays first only while it is healthy.
-  if (preferredClient && !clientCoolingDown(preferredClient)) {
-    const at = resolvers.findIndex((r) => r.name === preferredClient);
-    if (at > 0) resolvers.unshift(...resolvers.splice(at, 1));
-  }
-
-  // Video (ADDITIVE ONLY) runs alongside the audio chain rather than after it.
-  // It used to be awaited on the success path, which added up to three player
-  // calls to every single /stream — the app wants an answer inside 3 seconds.
-  const videoTask = wantVideo
-    ? fetchVideoInfo(trackId, env, userToken).catch(() => null)
-    : null;
-
-  // The chain RACES instead of queueing. Walking eleven identities one after
-  // another at a probe each is ten seconds of "preparing track" on a track
-  // YouTube is going to refuse anyway, and when every one of them refuses the
-  // listener just sees the spinner. Racing them means the answer — success or
-  // failure — arrives in about the time of the slowest of the first two.
-  //
-  // The identity that last worked keeps the head of the queue: it starts at
-  // once while the others are staggered, both to keep it first and because
-  // firing eleven player calls in the same instant is itself a machine
-  // signature (the stagger is the same one the old queue slept for).
-  const resolveStartedAt = Date.now();
-  let settled = false;
-  const attempt = (resolver, index) => (async () => {
-    if (index > 0) await new Promise(r => setTimeout(r, 200 * index));
-    if (settled || Date.now() - resolveStartedAt > RESOLVE_BUDGET_MS) return null;
-    // Skip an identity that was just refused, unless it is the last hope left.
-    if (clientCoolingDown(resolver.name) && resolvers.some((r) => !clientCoolingDown(r.name))) {
-      console.log(LOG_PREFIX, `${resolver.name} cooling down for ${trackId}`);
-      return null;
-    }
+  for (let i = 0; i < resolvers.length; i++) {
+    const resolver = resolvers[i];
+    // FIX (2.9.7): small randomized delay before each fallback attempt.
+    // Firing back-to-back player-API calls from the same Workers IP with
+    // zero spacing is itself a machine-pattern signature, independent of
+    // which client each call claims to be. Only sleep BETWEEN attempts
+    // (never before the first) so the common case — first resolver
+    // succeeds — pays no extra latency.
+    if (i > 0) await new Promise(r => setTimeout(r, 150 + Math.floor(Math.random() * 250)));
     try {
       const result = await resolver.run();
-      if (!result) return null;
-      // Verify before handing it out: a PO-token-gated link answers 206 at
-      // byte 0 and 403 a megabyte in, which is a track that starts and then
-      // dies — or never starts, depending on where the player seeks first.
-      // Only an explicit refusal costs us the attempt; 'unknown' (timeout,
-      // network hiccup) is accepted, since an unverified URL beats none.
-      if (resolver.name !== 'Direct') {
-        const verdict = await directCheck({ url: result.url, isHls: result.format === 'hls', size: 0 });
-        if (verdict === 'bad') {
-          if (!settled) {
-            console.log(LOG_PREFIX, resolver.name + ' returned a gated link for ' + trackId + ' — trying next client');
-            // Gated twice in a row means the identity, not the track, is the
-            // problem — let it cool down like a bot verdict.
-            noteClientFailure(resolver.name, 'gated link');
-          }
-          return null;
+      if (result) {
+        console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}`);
+        // ADDITIVE ONLY: try to attach a `video` object (eclipsemusic.app/docs
+        // "Video Playback"). This is wrapped so it can never affect or block
+        // the audio result above — worst case, `video` is just left unset.
+        try {
+          const video = await fetchVideoInfo(trackId, env, userToken);
+          if (video) result.video = video;
+        } catch (e) {
+          console.log(LOG_PREFIX, `video attach skipped for ${trackId}:`, e.message);
         }
+        return result;
       }
-      // A racer that finishes after the race is already won must not report a
-      // failure (it only got here because the winner was announced) or write
-      // over the winner's health record.
-      if (settled) return null;
-      settled = true;
-      if (resolver.name !== 'Direct') noteClientSuccess(resolver.name);
-      console.log(LOG_PREFIX, `${resolver.name} resolved for ${trackId}`);
-      result.expiresAt = urlExpirySeconds(result.url);
-      if (videoTask) {
-        // Never let an optional field hold the reply: 250 ms or nothing.
-        const video = await Promise.race([videoTask, new Promise(r => setTimeout(() => r(null), 250))]);
-        if (video) result.video = video;
-      }
-      return result;
     } catch (e) {
-      if (!settled) {
-        noteClientFailure(resolver.name, e.message);
-        console.log(LOG_PREFIX, `${resolver.name} failed for ${trackId}: ${e.message}`);
-      }
-      return null;
+      console.log(LOG_PREFIX, `${resolver.name} failed for ${trackId}: ${e.message}`);
     }
-  })();
-
-  // First success wins; the rest are left to settle on their own.
-  const pending = new Set(resolvers.map(attempt));
-  let winner = null;
-  while (pending.size) {
-    const first = await Promise.race([...pending].map((p) => p.then((v) => ({ p, v }))));
-    pending.delete(first.p);
-    if (first.v) { winner = first.v; break; }
   }
-  if (winner) return winner;
-  console.log(LOG_PREFIX, `resolve chain finished with no client for ${trackId} (${Date.now() - resolveStartedAt} ms)`);
-  // Last resort: our own SABR proxy. The track is pulled and cached here, so
-  // the URL handed out answers its first request immediately — and only gets a
-  // URL if the pull actually succeeded, which is what stops the player from
-  // spinning on a proxy that would 503 it.
-  if (origin) {
-    console.log(LOG_PREFIX, `every client failed for ${trackId} — warming the SABR proxy`);
-    const entry = await sabrMaterialize(trackId, env, userToken);
-    if (entry) {
-      return {
-        url: `${origin}/sabr/${trackId}`,
-        format: 'm4a',
-        quality: 'sabr',
-        proxied: true,
-        expiresAt: Math.floor(Date.now() / 1000) + 6 * 3600,
-      };
-    }
-    console.log(LOG_PREFIX, `SABR proxy could not pull ${trackId} either`);
-  }
-  if (gatedMemo.size >= MAX_MEMO) gatedMemo.delete(gatedMemo.keys().next().value);
-  gatedMemo.set(trackId, Date.now() + GATED_MEMO_MS);
-  throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — every client and the SABR proxy were refused`);
-}
-
-// ── Resolve memo, RAM only ────────────────────────────────────────────────────
-// Swiping through a queue used to spend a full player call — and on a bad run,
-// ten of them with a sleep between each — per track, so YouTube answered the
-// burst with bot checks and the next song sat on "loading". A finished resolve
-// is therefore reused for a few minutes, and two requests for the same track
-// (a skip landing on a track the app is already prefetching) share one call.
-// Nothing is written to disk or to Redis: this dies with the isolate.
-const RESOLVE_TTL_MS = 6 * 60 * 1000;
-// How long the client chain may spend before the SABR proxy answers instead.
-const RESOLVE_BUDGET_MS = 2500;
-// A track YouTube has just refused is not asked again immediately. The player
-// retries a failed track several times, and each retry used to cost a full
-// chain — the countdown that the listener reads as "preparing track".
-const GATED_MEMO_MS = 60 * 1000;
-const gatedMemo = new Map(); // trackId -> moment it may be tried again
-const MAX_MEMO = 200;
-const resolveMemo = new Map();     // trackId -> { at, result }
-const resolveInflight = new Map(); // trackId -> Promise
-let preferredClient = null;        // the client that worked last time
-
-// ── Client health ─────────────────────────────────────────────────────────────
-// Modeled on InnerTubeX's ClientHealthMonitor (MetrolistGroup/innertubex,
-// extraction/PlayerClientDirector.kt): the Kotlin client records failures per
-// identity and stops asking a client that has just been refused, instead of
-// re-walking the same chain from the top on every track. A client that answers
-// "Sign in to confirm you're not a bot" keeps answering it for the next several
-// requests, so leading with it costs the app a failed round trip per song and
-// keeps the verdict warm.
-//
-// Advisory only: if every identity is cooling down the chain runs anyway, so a
-// bad minute can never turn into a track that will not play.
-const CLIENT_COOLDOWN_MS = 90 * 1000;
-const CLIENT_BLOCKED_COOLDOWN_MS = 5 * 60 * 1000;
-const CLIENT_FAILS_BEFORE_COOLDOWN = 2;
-const clientHealth = new Map(); // client name -> { fails, until }
-
-// Bot verdicts are per-identity and sticky; ordinary network errors are not.
-function clientBotBlocked(message) {
-  return /bot|sign in|login required|unusual traffic|captcha|not a robot/i.test(String(message || ''));
-}
-
-function noteClientFailure(name, message) {
-  const now = Date.now();
-  const prev = clientHealth.get(name) || { fails: 0, until: 0 };
-  const fails = prev.fails + 1;
-  const blocked = clientBotBlocked(message);
-  const cooling = blocked || fails >= CLIENT_FAILS_BEFORE_COOLDOWN;
-  clientHealth.set(name, {
-    fails,
-    until: cooling ? now + (blocked ? CLIENT_BLOCKED_COOLDOWN_MS : CLIENT_COOLDOWN_MS) : prev.until,
-  });
-}
-
-function noteClientSuccess(name) {
-  clientHealth.delete(name);
-  preferredClient = name;
-}
-
-function clientCoolingDown(name) {
-  const entry = clientHealth.get(name);
-  return !!entry && entry.until > Date.now();
-}
-
-// A googlevideo link carries its own expiry; handing one out that is about to
-// lapse is what makes a track fail a second after it started.
-function urlExpirySeconds(u) {
-  try {
-    const t = Number(new URL(u).searchParams.get('expire'));
-    if (Number.isFinite(t) && t > 0) return t;
-  } catch {}
-  return Math.floor(Date.now() / 1000) + 6 * 3600;
-}
-
-function memoGet(trackId) {
-  const hit = resolveMemo.get(trackId);
-  if (!hit) return null;
-  const stale = Date.now() - hit.at > RESOLVE_TTL_MS;
-  const expiring = hit.result?.expiresAt && hit.result.expiresAt * 1000 < Date.now() + 60 * 1000;
-  if (stale || expiring) { resolveMemo.delete(trackId); return null; }
-  return hit.result;
-}
-
-function memoPut(trackId, result) {
-  if (resolveMemo.size >= MAX_MEMO) resolveMemo.delete(resolveMemo.keys().next().value);
-  resolveMemo.set(trackId, { at: Date.now(), result });
+  throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
 }
 
 async function proxyDownload(trackId, incomingRequest, env, userToken) {
@@ -1612,93 +1080,6 @@ async function proxyDownload(trackId, incomingRequest, env, userToken) {
   if (upstream.headers.get('content-range')) resHeaders['content-range'] = upstream.headers.get('content-range');
   if (upstream.headers.get('accept-ranges')) resHeaders['accept-ranges'] = upstream.headers.get('accept-ranges');
   return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
-}
-
-// ── SABR proxy (see sabr.js) ──────────────────────────────────────────────────
-// The track is pulled whole over SABR, cached, and served as a real file. A
-// relayed live session cannot answer Range requests (it always restarts at
-// zero), which is exactly what made seeking pause the track forever.
-const SABR_MEM_MAX = 6;
-const SABR_MEM_TTL_MS = 30 * 60 * 1000;
-const SABR_CACHE_TTL_SEC = 6 * 3600;
-const sabrMemory = new Map(); // trackId -> { at, bytes, contentType }
-
-function sabrCacheUrl(trackId) {
-  return `https://sabr-cache.internal/${trackId}`;
-}
-
-async function sabrCacheGet(trackId) {
-  const hit = sabrMemory.get(trackId);
-  if (hit && Date.now() - hit.at < SABR_MEM_TTL_MS) return hit;
-  sabrMemory.delete(trackId);
-  try {
-    const cached = await caches.default.match(sabrCacheUrl(trackId));
-    if (!cached) return null;
-    const bytes = new Uint8Array(await cached.arrayBuffer());
-    if (!bytes.byteLength) return null;
-    const entry = { at: Date.now(), bytes, contentType: cached.headers.get('content-type') || 'audio/mp4' };
-    sabrMemory.set(trackId, entry);
-    return entry;
-  } catch {
-    return null;
-  }
-}
-
-async function sabrCachePut(trackId, entry) {
-  if (sabrMemory.size >= SABR_MEM_MAX) sabrMemory.delete(sabrMemory.keys().next().value);
-  sabrMemory.set(trackId, entry);
-  try {
-    await caches.default.put(
-      sabrCacheUrl(trackId),
-      new Response(entry.bytes, {
-        headers: { 'content-type': entry.contentType, 'cache-control': `public, max-age=${SABR_CACHE_TTL_SEC}` },
-      }),
-    );
-  } catch (e) {
-    console.log(LOG_PREFIX, `SABR: cache write failed for ${trackId}: ${e.message}`);
-  }
-}
-
-/** Pull a track over SABR once and cache it. Returns null if no identity can. */
-async function sabrMaterialize(trackId, env, userToken) {
-  const cached = await sabrCacheGet(trackId);
-  if (cached) return cached;
-  const attempts = [
-    { name: 'AndroidVR', fetchPlayer: () => fetchPlayerDataAndroidVR(trackId, env, userToken), clientInfo: SABR_CLIENTS.androidVR },
-    { name: 'iOS', fetchPlayer: () => fetchPlayerData(trackId, env, userToken), clientInfo: SABR_CLIENTS.ios },
-  ];
-  for (const attempt of attempts) {
-    const startedAt = Date.now();
-    try {
-      const data = await attempt.fetchPlayer();
-      const track = await materializeSabrTrack({
-        data,
-        videoId: trackId,
-        clientInfo: attempt.clientInfo,
-        // A generator that is not configured must not be called at all.
-        mintPoToken: env?.YT_PO_TOKEN_GENERATOR_URL ? () => mintPoTokenBytes(env) : undefined,
-      });
-      const entry = { at: Date.now(), bytes: track.bytes, contentType: track.contentType };
-      await sabrCachePut(trackId, entry);
-      console.log(LOG_PREFIX, `SABR: ${attempt.name} materialized ${trackId} ${track.bytes.byteLength}B in ${Date.now() - startedAt}ms`);
-      return entry;
-    } catch (e) {
-      console.log(LOG_PREFIX, `SABR: ${attempt.name} failed for ${trackId} after ${Date.now() - startedAt}ms: ${e.message}`);
-    }
-  }
-  return null;
-}
-
-async function handleSabr(trackId, request, env, userToken) {
-  const entry = await sabrMaterialize(trackId, env, userToken);
-  if (!entry) return null;
-  const range = parseByteRange(request.headers.get('range'), entry.bytes.byteLength);
-  return serveAudioBytes({
-    bytes: entry.bytes,
-    contentType: entry.contentType,
-    range,
-    head: request.method === 'HEAD',
-  });
 }
 
 function extractSecondaryTracks(data, fallbackArtist, fallbackAlbum, fallbackArtwork) {
@@ -1856,7 +1237,7 @@ function buildManifest(mode) {
   };
   const v = variants[m] || variants.both;
   return {
-    id: v.id, name: v.name, version: '2.13.2', description: v.description,
+    id: v.id, name: v.name, version: '2.9.11', description: v.description,
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'download', 'catalog', 'settings'],
     types: ['track', 'album', 'artist', 'playlist'],
@@ -2088,47 +1469,13 @@ async function handleRoute(rest, url, request, env, userToken, mode) {
     });
   }
   if (rest === '/manifest.json' || rest === '/manifest') return jsonRes(buildManifest(mode));
-  const ECLIPSE_GATED_PREFIXES = ["/search", "/stream", "/download", "/album", "/artist", "/playlist", "/sabr"];
+  const ECLIPSE_GATED_PREFIXES = ["/search", "/stream", "/download", "/album", "/artist", "/playlist"];
 if (ECLIPSE_GATED_PREFIXES.some((p) => rest === p || rest.startsWith(p + "/"))) {
   const eclipseClaims = await checkEclipseAccess(request);
   if (!eclipseClaims) return eclipseAccessDeniedResponse();
 }
   if (rest === '/search') return jsonRes(await handleSearch(q, env, userToken, effectiveMode));
-  if (rest.startsWith('/stream/')) {
-    const id = lastSegment(rest);
-    if (!id) return jsonRes({ error: 'Missing ID' }, 400);
-    const startedAt = Date.now();
-    try {
-      const body = await handleStream(id, env, userToken, effectiveMode !== 'songs', url.origin);
-      // Visible in `wrangler tail`: a skip that took 3 s shows up as one line.
-      console.log(LOG_PREFIX, `stream ${id} in ${Date.now() - startedAt}ms via ${body?.format || '?'}`);
-      return jsonRes(body);
-    } catch (e) {
-      // Answer retryably instead of hanging: Eclipse honours Retry-After, so a
-      // track whose clients are all bot-checked this second is retried a second
-      // later instead of leaving the player spinning.
-      console.log(LOG_PREFIX, `stream unavailable for ${id}: ${e.message}`);
-      return new Response(JSON.stringify({ error: 'Not ready' }), {
-        status: 503,
-        headers: {
-          'content-type': 'application/json; charset=utf-8',
-          'access-control-allow-origin': '*',
-          'cache-control': 'no-store',
-          'retry-after': '1',
-        },
-      });
-    }
-  }
-  if (rest.startsWith('/sabr/')) {
-    const id = lastSegment(rest);
-    if (!id) return jsonRes({ error: 'Missing ID' }, 400);
-    const streamed = await handleSabr(id, request, env, userToken);
-    if (streamed) return streamed;
-    return new Response(JSON.stringify({ error: 'Not ready' }), {
-      status: 503,
-      headers: { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store', 'retry-after': '1' },
-    });
-  }
+  if (rest.startsWith('/stream/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleStream(id, env, userToken)); }
   if (rest.startsWith('/download/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return await proxyDownload(id, request, env, userToken); }
   if (rest.startsWith('/album/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleAlbum(id, env, userToken)); }
   if (rest.startsWith('/artist/')) { const id = lastSegment(rest); if (!id) return jsonRes({ error: 'Missing ID' }, 400); return jsonRes(await handleArtist(id, env, userToken, effectiveMode)); }
