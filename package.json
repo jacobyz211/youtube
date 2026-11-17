@@ -1,28 +1,17 @@
 {
-  "name": "eclipse-ytmusic",
-  "version": "2.13.2",
+  "name": "youtube",
+  "version": "1.0.0",
   "description": "YouTube Music addon for Eclipse — powered by Cloudflare Workers",
   "main": "index.js",
-  "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "tail": "wrangler tail",
-    "test": "node tools/test-client-health.mjs && node tools/test-sabr.mjs"
+    "tail": "wrangler tail"
   },
   "devDependencies": {
     "wrangler": "^3.114.4"
   },
-  "keywords": [
-    "eclipse",
-    "music",
-    "youtube",
-    "cloudflare-workers",
-    "addon"
-  ],
+  "keywords": ["eclipse", "music", "youtube", "cloudflare-workers", "addon"],
   "author": "ricky",
-  "license": "MIT",
-  "dependencies": {
-    "googlevideo": "^5.0.1"
-  }
+  "license": "MIT"
 }
